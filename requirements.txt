@@ -1,0 +1,6 @@
+ezdxf
+shapely
+numpy
+pytest
+mypy
+ruff
