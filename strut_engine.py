@@ -17,7 +17,7 @@ from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, P
 Point2D = tuple[float, float]
 Geometry = list[Point2D]
 
-SUPPORT_SYSTEMS = {"orthogonal", "brace", "straight_truss", "circular"}
+SUPPORT_SYSTEMS = {"orthogonal", "brace", "opposite_strut", "straight_truss", "circular"}
 STATS_KEYS = (
     "main_strut_length",
     "corner_length",
@@ -168,8 +168,8 @@ class StrutEngine:
             self.solve_orthogonal(layout)
         elif system == "brace":
             self.solve_brace(layout)
-        elif system == "straight_truss":
-            self.solve_straight_truss(layout)
+        elif system in {"opposite_strut", "straight_truss"}:
+            self.solve_opposite_strut(layout)
         elif system == "circular":
             self.solve_circular(layout)
         else:  # pragma: no cover - guarded by parameter normalization.
@@ -210,19 +210,23 @@ class StrutEngine:
         self._place_single_direction_ties(layout, struts, waling_poly)
         self._place_secondary_perimeter_supports(layout, waling_poly)
         if self._uses_large_corner_truss(waling_poly):
+            self._place_edge_truss(layout, waling_poly)
             self._place_corner_trusses(layout, waling_poly)
         else:
             self._place_corner_struts(layout, waling_poly)
         self._add_structural_cross_nodes(layout)
         self._place_pillars_from_nodes(layout, waling_poly)
 
-    def solve_straight_truss(self, layout: dict[str, Any]) -> None:
+    def solve_opposite_strut(self, layout: dict[str, Any]) -> None:
         waling_poly = self._place_waling(layout)
-        struts = self._place_grouped_main_struts(layout, waling_poly)
-        self._place_truss_coupling_ties(layout, struts, waling_poly)
-        self._place_edge_truss(layout, waling_poly)
+        struts = self._place_main_struts(layout, waling_poly, include_x=True, include_y=True)
+        self._place_single_direction_ties(layout, struts, waling_poly)
+        self._place_opposite_strut_y_ties(layout, struts, waling_poly)
         self._add_structural_cross_nodes(layout)
         self._place_pillars_from_nodes(layout, waling_poly)
+
+    def solve_straight_truss(self, layout: dict[str, Any]) -> None:
+        self.solve_opposite_strut(layout)
 
     def solve_circular(self, layout: dict[str, Any]) -> None:
         waling_poly = self._place_waling(layout)
@@ -603,22 +607,18 @@ class StrutEngine:
             self.params["truss_panel_min"],
             min(self.params["spacing"], self.params["truss_panel_max"]),
         )
-        arm = min(max(self.params["spacing"] * 1.8, panel * 1.5), min(waling_poly.bounds[2] - waling_poly.bounds[0], waling_poly.bounds[3] - waling_poly.bounds[1]) * 0.28)
-
         for index, corner in enumerate(coords):
             prev_pt = coords[index - 1]
             next_pt = coords[(index + 1) % len(coords)]
             layers = max(1, int(round(float(self.params["corner_layers"]))))
-            if layers == 1:
-                scales = [0.6]
-            else:
-                scales = [
-                    0.45 + 0.30 * layer / (layers - 1)
-                    for layer in range(layers)
-                ]
-            for scale in scales:
-                left = _point_along(corner, prev_pt, arm * scale)
-                right = _point_along(corner, next_pt, arm * scale)
+            first_offset = float(self.params["spacing"])
+            layer_step = max(float(self.params["spacing_min"]) * 0.75, panel * 0.5)
+            for layer in range(layers):
+                target = first_offset + layer_step * layer
+                left = self._edge_truss_node_near(layout, corner, prev_pt, target)
+                right = self._edge_truss_node_near(layout, corner, next_pt, target)
+                if left is None or right is None:
+                    continue
                 candidate = [left, right]
                 line = LineString(candidate)
                 if line.length <= 1e-9:
@@ -632,6 +632,30 @@ class StrutEngine:
                     old_key="corners",
                     node_kind="corner_end",
                 )
+
+    def _edge_truss_node_near(
+        self,
+        layout: dict[str, Any],
+        corner: Point2D,
+        edge_end: Point2D,
+        min_distance: float,
+    ) -> Point2D | None:
+        edge = LineString([corner, edge_end])
+        candidates: list[tuple[float, Point2D]] = []
+        for node in layout["nodes"]:
+            if "truss_node" not in node["kind"]:
+                continue
+            point = (float(node["pos"][0]), float(node["pos"][1]))
+            distance = Point(point).distance(Point(corner))
+            if distance + 1e-6 < min_distance:
+                continue
+            if edge.distance(Point(point)) > 1e-6:
+                continue
+            candidates.append((distance, point))
+        if not candidates:
+            return None
+        _, point = min(candidates, key=lambda item: (abs(item[0] - min_distance), item[0]))
+        return point
 
     def _uses_large_corner_truss(self, waling_poly: Polygon) -> bool:
         return max(
@@ -850,6 +874,43 @@ class StrutEngine:
             for ratio in self.params["tie_ratio"]:
                 y = y_min + (y_max - y_min) * float(ratio)
                 candidate = [(left_geom[0][0], y), (right_geom[0][0], y)]
+                line = LineString(candidate)
+                if line.length < self.params["spacing_min"] * 0.25:
+                    continue
+                if not waling_poly.buffer(1e-6).covers(line):
+                    continue
+                if not self._candidate_clear(layout, candidate, {"main_strut", "corner", "tie"}):
+                    continue
+                self._add_linear_member(
+                    layout,
+                    "tie",
+                    candidate,
+                    old_key="ties",
+                    node_kind="tie_end",
+                )
+
+    def _place_opposite_strut_y_ties(
+        self,
+        layout: dict[str, Any],
+        struts: list[dict[str, Any]],
+        waling_poly: Polygon,
+    ) -> None:
+        horizontal = [item for item in struts if item["axis"] == "y"]
+        horizontal.sort(key=lambda item: _member_midpoint(item["member"])[1])
+        if len(horizontal) < 2:
+            return
+
+        for bottom, top in zip(horizontal, horizontal[1:]):
+            bottom_geom = bottom["member"]["geometry"]
+            top_geom = top["member"]["geometry"]
+            x_min = max(min(bottom_geom[0][0], bottom_geom[-1][0]), min(top_geom[0][0], top_geom[-1][0]))
+            x_max = min(max(bottom_geom[0][0], bottom_geom[-1][0]), max(top_geom[0][0], top_geom[-1][0]))
+            if x_max - x_min < self.params["spacing_min"]:
+                continue
+
+            for ratio in self.params["tie_ratio"]:
+                x = x_min + (x_max - x_min) * float(ratio)
+                candidate = [(x, bottom_geom[0][1]), (x, top_geom[0][1])]
                 line = LineString(candidate)
                 if line.length < self.params["spacing_min"] * 0.25:
                     continue

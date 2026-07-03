@@ -89,10 +89,10 @@ CASES = [
         },
     ),
     Case(
-        "large_rect_120x80_straight_truss",
+        "large_rect_120x80_opposite_strut",
         [(0, 0), (120, 0), (120, 80), (0, 80)],
         {
-            "support_system": "straight_truss",
+            "support_system": "opposite_strut",
             "spacing": 12.0,
             "spacing_min": 8.0,
             "spacing_max": 14.0,
@@ -132,7 +132,7 @@ def test_parameter_governance() -> None:
     ).solve()
     assert layout["waling"]
 
-    for system in ("orthogonal", "brace", "straight_truss", "circular"):
+    for system in ("orthogonal", "brace", "opposite_strut", "straight_truss", "circular"):
         params: dict[str, Any] = {"support_system": system}
         if system == "circular":
             params.update({"core_center": (15, 10), "core_diameter": 4})
@@ -188,9 +188,14 @@ def test_system_specific_outputs() -> None:
     assert any(member["kind"] == "ring_strut" for member in circular["members"])
     assert any(outline["layer"] == "CORE_PROTECTION" for outline in circular["outlines"])
 
-    truss = solve_case(next(case for case in CASES if case.name == "straight_truss_rect"))
-    assert truss["stats"]["truss_web_length"] > 0
-    assert any(member["kind"] == "truss_web" for member in truss["members"])
+    opposite = solve_case(next(case for case in CASES if case.name == "straight_truss_rect"))
+    assert opposite["stats"]["truss_web_length"] == 0
+    assert all(member["kind"] not in {"truss_chord", "truss_web", "corner"} for member in opposite["members"])
+
+    brace = solve_case(next(case for case in CASES if case.name == "large_rect_120x80_brace"))
+    assert brace["stats"]["truss_web_length"] > 0
+    assert brace["stats"]["corner_length"] > 0
+    assert any(member["kind"] == "truss_web" for member in brace["members"])
 
     octagon_circular = solve_case(next(case for case in CASES if case.name == "octagon_circular_core"))
     assert octagon_circular["stats"]["ring_strut_length"] > 0
@@ -203,26 +208,21 @@ def test_system_specific_outputs() -> None:
     assert any("strut_cross" in node["kind"] for node in rect["nodes"])
 
 
-def test_straight_truss_generates_engineering_network() -> None:
+def test_opposite_strut_generates_engineering_network_without_truss() -> None:
     case = next(case for case in CASES if case.name == "straight_truss_rect")
     layout = solve_case(case)
     engine = StrutEngine(case.coords, case.params)
     waling_poly = engine._offset_poly(engine.params["waling_offset"])
     assert waling_poly is not None
 
-    depth = engine.params["truss_depth"]
     chords = [member for member in layout["members"] if member["kind"] == "truss_chord"]
     webs = [member for member in layout["members"] if member["kind"] == "truss_web"]
     ties = [member for member in layout["members"] if member["kind"] == "tie"]
+    main = [member for member in layout["members"] if member["kind"] == "main_strut"]
 
-    edge_chords = [
-        member for member in chords
-        if waling_poly.exterior.distance(
-            LineString(member["geometry"]).interpolate(0.5, normalized=True)
-        ) <= depth * 1.75
-    ]
-    assert len(edge_chords) >= 4
-    assert len(webs) >= 24
+    assert chords == []
+    assert webs == []
+    assert main
     assert ties
 
     legal_node_ids = {
@@ -232,8 +232,8 @@ def test_straight_truss_generates_engineering_network() -> None:
     assert all(tie["start"] in legal_node_ids and tie["end"] in legal_node_ids for tie in ties)
 
 
-def test_straight_truss_has_sparse_two_direction_strut_pairs_without_internal_truss() -> None:
-    case = next(case for case in CASES if case.name == "large_rect_120x80_straight_truss")
+def test_opposite_strut_has_uniform_two_direction_struts_without_truss_or_corners() -> None:
+    case = next(case for case in CASES if case.name == "large_rect_120x80_opposite_strut")
     layout = solve_case(case)
     waling_line = LineString(layout["waling"])
     bounds = Polygon(layout["waling"]).bounds
@@ -244,10 +244,14 @@ def test_straight_truss_has_sparse_two_direction_strut_pairs_without_internal_tr
     vertical_groups = _axis_groups(_axis_values(vertical, "x"), max_pair_gap=8.0)
     horizontal_groups = _axis_groups(_axis_values(horizontal, "y"), max_pair_gap=8.0)
 
-    assert len(vertical_groups) == 2
-    assert len(horizontal_groups) == 1
-    assert all(len(group) == 2 for group in vertical_groups + horizontal_groups)
-    assert _minimum_group_spacing(vertical_groups) >= 24.0
+    assert len(vertical_groups) >= 3
+    assert len(horizontal_groups) >= 3
+    assert all(len(group) == 1 for group in vertical_groups + horizontal_groups)
+    assert _minimum_group_spacing(vertical_groups) >= 10.0
+    assert _minimum_group_spacing(horizontal_groups) >= 10.0
+
+    assert all(member["kind"] != "corner" for member in layout["members"])
+    assert all(member["kind"] not in {"truss_chord", "truss_web"} for member in layout["members"])
 
     internal_truss = [
         member for member in layout["members"]
@@ -260,13 +264,11 @@ def test_straight_truss_has_sparse_two_direction_strut_pairs_without_internal_tr
     ties = [member for member in layout["members"] if member["kind"] == "tie"]
     assert any(_is_horizontal(tie) for tie in ties)
     assert any(_is_vertical(tie) for tie in ties)
-    assert len([tie for tie in ties if _is_horizontal(tie)]) >= 8
-    assert len([tie for tie in ties if _is_vertical(tie)]) >= 6
-    assert all(LineString(tie["geometry"]).length <= 8.0 for tie in ties)
+    assert all(10.0 <= LineString(tie["geometry"]).length <= case.params["spacing_max"] + 1.0 for tie in ties)
 
 
-def test_edge_truss_uses_near_45_degree_k_webs() -> None:
-    case = next(case for case in CASES if case.name == "large_rect_120x80_straight_truss")
+def test_brace_edge_truss_uses_economic_diagonal_webs_near_corners() -> None:
+    case = next(case for case in CASES if case.name == "large_rect_120x80_brace")
     layout = solve_case(case)
     waling_line = LineString(layout["waling"])
     edge_webs = [
@@ -287,7 +289,7 @@ def test_edge_truss_uses_near_45_degree_k_webs() -> None:
         if _acute_axis_angle(member) < 25.0
     ]
 
-    assert len(diagonal_webs) >= 24
+    assert len(diagonal_webs) >= 16
     assert len(post_webs) <= 4
     assert shallow_webs == []
 
@@ -295,11 +297,11 @@ def test_edge_truss_uses_near_45_degree_k_webs() -> None:
 def test_large_brace_corners_use_regular_diagonal_corner_braces() -> None:
     case = next(case for case in CASES if case.name == "large_rect_120x80_brace")
     layout = solve_case(case)
-    pit = Polygon(case.coords)
-    corner_zones = [Point(point).buffer(22.0) for point in list(pit.exterior.coords)[:-1]]
+    pit_corners = list(Polygon(case.coords).exterior.coords)[:-1]
     waling_corners = list(Polygon(layout["waling"]).exterior.coords)[:-1]
+    corner_zones = [Point(point).buffer(35.0) for point in waling_corners]
 
-    for zone in corner_zones:
+    for zone, pit_corner in zip(corner_zones, pit_corners):
         corner_members = [
             member for member in layout["members"]
             if member["kind"] == "corner"
@@ -309,9 +311,23 @@ def test_large_brace_corners_use_regular_diagonal_corner_braces() -> None:
         assert len(corner_members) >= 3
         assert all(35.0 <= _acute_axis_angle(member) <= 55.0 for member in corner_members)
         assert all(
-            min(Point(point).distance(Point(corner)) for corner in waling_corners) >= 7.0
+            min(Point(point).distance(Point(corner)) for corner in waling_corners) >= case.params["spacing"]
             for member in corner_members
             for point in member["geometry"]
+        )
+        assert all(
+            Point(endpoint).distance(Point(pit_corner)) > case.params["spacing"]
+            for member in corner_members
+            for endpoint in member["geometry"]
+        )
+        truss_nodes = [
+            tuple(node["pos"]) for node in layout["nodes"]
+            if "truss_node" in node["kind"]
+        ]
+        assert all(
+            any(Point(endpoint).distance(Point(node)) <= 1e-6 for node in truss_nodes)
+            for member in corner_members
+            for endpoint in member["geometry"]
         )
 
 
@@ -342,8 +358,8 @@ def test_octagonal_pit_gets_secondary_perimeter_supports() -> None:
     assert secondary
 
 
-def test_straight_truss_ties_connect_only_same_main_strut_pairs() -> None:
-    case = next(case for case in CASES if case.name == "large_rect_120x80_straight_truss")
+def test_opposite_strut_ties_connect_adjacent_main_struts() -> None:
+    case = next(case for case in CASES if case.name == "large_rect_120x80_opposite_strut")
     layout = solve_case(case)
     main_struts = [member for member in layout["members"] if member["kind"] == "main_strut"]
     ties = [
@@ -363,13 +379,13 @@ def test_straight_truss_ties_connect_only_same_main_strut_pairs() -> None:
             )
         ]
         assert len(connected_main) == 2, member
-        assert LineString(member["geometry"]).length <= 8.0
+        assert 10.0 <= LineString(member["geometry"]).length <= case.params["spacing_max"] + 1.0
 
 
 def test_corner_truss_nodes_are_snapped_and_have_columns() -> None:
     case = next(case for case in CASES if case.name == "large_rect_120x80_brace")
     layout = solve_case(case)
-    corner_zones = [Point(point).buffer(18.0) for point in list(Polygon(case.coords).exterior.coords)[:-1]]
+    corner_zones = [Point(point).buffer(35.0) for point in list(Polygon(layout["waling"]).exterior.coords)[:-1]]
     corner_members = [
         member for member in layout["members"]
         if member["kind"] == "corner"
@@ -462,7 +478,7 @@ def test_designed_member_connections_are_explicit_nodes() -> None:
 
 
 def test_edge_truss_uses_waling_as_outer_chord() -> None:
-    case = next(case for case in CASES if case.name == "large_rect_120x80_straight_truss")
+    case = next(case for case in CASES if case.name == "large_rect_120x80_brace")
     layout = solve_case(case)
     waling_line = LineString(layout["waling"])
     outer_chord_length = sum(
@@ -513,7 +529,7 @@ def test_main_strut_grid_uses_edge_anchored_modular_spacing() -> None:
 
 
 def test_edge_truss_is_continuous_without_forced_main_grid_snap() -> None:
-    case = next(case for case in CASES if case.name == "large_rect_120x80_straight_truss")
+    case = next(case for case in CASES if case.name == "large_rect_120x80_brace")
     layout = solve_case(case)
     waling_poly = Polygon(layout["waling"])
     min_x, _, max_x, _ = waling_poly.bounds
@@ -530,7 +546,7 @@ def test_edge_truss_is_continuous_without_forced_main_grid_snap() -> None:
     assert top_truss_x
     assert round(min_x, 6) in top_truss_x
     assert round(max_x, 6) in top_truss_x
-    assert max(right - left for left, right in zip(top_truss_x, top_truss_x[1:])) <= case.params["truss_panel_min"]
+    assert max(right - left for left, right in zip(top_truss_x, top_truss_x[1:])) <= case.params["truss_panel_max"]
     main_top_x = sorted({
         round(point[0], 6)
         for member in layout["members"]
@@ -547,7 +563,7 @@ def test_edge_truss_is_continuous_without_forced_main_grid_snap() -> None:
 
 
 def test_truss_panels_use_edge_k_webs_without_internal_truss_posts() -> None:
-    case = next(case for case in CASES if case.name == "large_rect_120x80_straight_truss")
+    case = next(case for case in CASES if case.name == "large_rect_120x80_brace")
     engine = StrutEngine(case.coords, case.params)
     layout = engine.solve()
     waling_line = LineString(layout["waling"])
@@ -574,8 +590,7 @@ def test_truss_panels_use_edge_k_webs_without_internal_truss_posts() -> None:
 def test_large_pit_corner_braces_are_regular_diagonal_bands() -> None:
     case = next(case for case in CASES if case.name == "large_rect_120x80_brace")
     layout = solve_case(case)
-    pit = Polygon(case.coords)
-    corner_zones = [Point(point).buffer(18.0) for point in list(pit.exterior.coords)[:-1]]
+    corner_zones = [Point(point).buffer(35.0) for point in list(Polygon(layout["waling"]).exterior.coords)[:-1]]
     corner_members = [
         member for member in layout["members"]
         if member["kind"] == "corner"
@@ -585,13 +600,10 @@ def test_large_pit_corner_braces_are_regular_diagonal_bands() -> None:
 
 
 def test_pillars_are_sparse_and_not_every_truss_node() -> None:
-    case = next(case for case in CASES if case.name == "large_rect_120x80_straight_truss")
+    case = next(case for case in CASES if case.name == "large_rect_120x80_opposite_strut")
     layout = solve_case(case)
-    truss_node_count = sum(1 for node in layout["nodes"] if "truss_node" in node["kind"])
     required = _main_and_tie_intersection_points(layout)
-    required_count = len(required)
 
-    assert len(layout["pillars"]) < required_count + truss_node_count * 0.25
     assert required
     assert all(
         any(Point(pillar).distance(Point(point)) <= 0.1 for pillar in layout["pillars"])
@@ -609,7 +621,7 @@ def test_dxf_layers() -> None:
         circular_layers = _layer_names(circular_path)
         assert {"RING_STRUT", "RADIAL_STRUT", "CORE_PROTECTION"} <= circular_layers
 
-        truss_case = next(case for case in CASES if case.name == "straight_truss_rect")
+        truss_case = next(case for case in CASES if case.name == "large_rect_120x80_brace")
         truss = solve_case(truss_case)
         truss_path = base / "truss.dxf"
         export_strut_dxf(truss_path, truss_case.coords, truss)
@@ -620,7 +632,7 @@ def test_dxf_layers() -> None:
 def test_visual_diagnostics_export_png() -> None:
     from strut_diagnostics import export_strut_diagnostic_png
 
-    case = next(case for case in CASES if case.name == "large_rect_120x80_straight_truss")
+    case = next(case for case in CASES if case.name == "large_rect_120x80_opposite_strut")
     layout = solve_case(case)
     with tempfile.TemporaryDirectory() as tmp:
         png_path = Path(tmp) / "large_straight_truss_diagnostic.png"

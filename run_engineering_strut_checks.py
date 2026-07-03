@@ -32,10 +32,10 @@ class Case:
 
 CASES = [
     Case(
-        "straight_truss_60x40",
+        "opposite_strut_60x40",
         [(0, 0), (60, 0), (60, 40), (0, 40)],
         {
-            "support_system": "straight_truss",
+            "support_system": "opposite_strut",
             "spacing": 9.0,
             "spacing_min": 6.0,
             "spacing_max": 9.0,
@@ -47,10 +47,10 @@ CASES = [
         },
     ),
     Case(
-        "large_straight_truss_120x80",
+        "large_opposite_strut_120x80",
         [(0, 0), (120, 0), (120, 80), (0, 80)],
         {
-            "support_system": "straight_truss",
+            "support_system": "opposite_strut",
             "spacing": 12.0,
             "spacing_min": 8.0,
             "spacing_max": 14.0,
@@ -146,18 +146,41 @@ def _print_summary_and_check(
 
     failures += _check(report["ok"], f"geometry validation OK; issues={report['issues'][:5]}")
 
-    if case.params["support_system"] == "straight_truss":
-        failures += _check_edge_truss(case, layout)
+    if case.params["support_system"] == "opposite_strut":
+        failures += _check_opposite_strut(case, layout)
         failures += _check_grouped_coupling_ties(case, layout)
         failures += _check_required_pillars(case, layout)
 
     if case.name.startswith("large_brace"):
+        failures += _check_edge_truss(case, layout)
         failures += _check_large_corner_truss(case, layout)
 
     if case.params["support_system"] == "circular":
         failures += _check(stats["ring_strut_length"] > 0, "circular support has ring strut length")
         failures += _check(stats["radial_strut_length"] > 0, "circular support has radial strut length")
 
+    return failures
+
+
+def _check_opposite_strut(case: Case, layout: dict[str, Any]) -> int:
+    counts = Counter(member["kind"] for member in layout["members"])
+    failures = _check(counts["corner"] == 0, "opposite strut has no corner braces")
+    failures += _check(counts["truss_chord"] == 0, "opposite strut has no edge truss chords")
+    failures += _check(counts["truss_web"] == 0, "opposite strut has no edge truss webs")
+    main = [member for member in layout["members"] if member["kind"] == "main_strut"]
+    vertical = [member for member in main if _is_vertical(member)]
+    horizontal = [member for member in main if _is_horizontal(member)]
+    failures += _check(len(vertical) >= 3, f"opposite strut has distributed vertical struts; actual={len(vertical)}")
+    failures += _check(len(horizontal) >= 3, f"opposite strut has distributed horizontal struts; actual={len(horizontal)}")
+    min_required_spacing = min(10.0, float(case.params["spacing_min"]))
+    failures += _check(
+        _minimum_axis_spacing(vertical, "x") >= min_required_spacing,
+        "vertical opposite strut spacing is not too close",
+    )
+    failures += _check(
+        _minimum_axis_spacing(horizontal, "y") >= min_required_spacing,
+        "horizontal opposite strut spacing is not too close",
+    )
     return failures
 
 
@@ -226,6 +249,7 @@ def _check_grouped_coupling_ties(case: Case, layout: dict[str, Any]) -> int:
     vertical_ties = [member for member in ties if _is_vertical(member)]
     bounds = Polygon(layout["waling"]).bounds
     tie_interval = float(case.params.get("tie_interval", 14.0))
+    min_required_spacing = min(10.0, float(case.params["spacing_min"]))
     expected_horizontal = max(2, int((bounds[3] - bounds[1]) / tie_interval) - 1)
     expected_vertical = max(2, int((bounds[2] - bounds[0]) / tie_interval) - 1)
     failures = _check(
@@ -237,8 +261,8 @@ def _check_grouped_coupling_ties(case: Case, layout: dict[str, Any]) -> int:
         f"vertical paired-strut ties present; actual={len(vertical_ties)}, expected>={expected_vertical}",
     )
     failures += _check(
-        all(LineString(member["geometry"]).length <= float(case.params["spacing_min"]) for member in ties),
-        "coupling ties connect paired main struts only",
+        all(min_required_spacing <= LineString(member["geometry"]).length <= float(case.params["spacing_max"]) + 1.0 for member in ties),
+        "ties connect adjacent opposite struts without dense spacing",
     )
     return failures
 
@@ -316,6 +340,16 @@ def _axis_groups(values: list[float], max_pair_gap: float) -> list[list[float]]:
         else:
             groups.append([value])
     return groups
+
+
+def _minimum_axis_spacing(members: list[dict[str, Any]], axis: str) -> float:
+    if len(members) < 2:
+        return float("inf")
+    index = 0 if axis == "x" else 1
+    values = sorted({round(member["geometry"][0][index], 6) for member in members})
+    if len(values) < 2:
+        return float("inf")
+    return min(right - left for left, right in zip(values, values[1:]))
 
 
 def _acute_axis_angle(member: dict[str, Any]) -> float:
