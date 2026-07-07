@@ -2,7 +2,21 @@ __pycache__/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+.venv/
+venv/
+env/
+.coverage
+htmlcov/
 *.pyc
 *.pyo
 *.tmp
 *.bak.tmp
+*.log
+*.bak
+~$*
+
+# Local scratch outputs. Curated regression artifacts in
+# engineering_check_outputs/ are intentionally tracked.
+_*.dxf
+_*.png
+plot.log
