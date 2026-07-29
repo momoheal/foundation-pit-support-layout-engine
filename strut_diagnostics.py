@@ -18,6 +18,25 @@ MEMBER_STYLES = {
 }
 
 
+def _main_truss_connection_points(layout: dict[str, Any]) -> list[tuple[float, float]]:
+    kind_by_member_id = {
+        member["id"]: member["kind"]
+        for member in layout.get("members", [])
+    }
+    points = {
+        (round(float(node["pos"][0]), 6), round(float(node["pos"][1]), 6))
+        for node in layout.get("nodes", [])
+        for source_kinds in [{
+            kind_by_member_id[member_id]
+            for member_id in node.get("source", [])
+            if member_id in kind_by_member_id
+        }]
+        if "main_strut" in source_kinds
+        and source_kinds.intersection({"truss_chord", "truss_web"})
+    }
+    return sorted(points)
+
+
 def export_strut_diagnostic_png(
     path: str | Path,
     boundary: list[tuple[float, float]],
@@ -61,6 +80,19 @@ def export_strut_diagnostic_png(
             linewidth=style["linewidth"],
             solid_capstyle="round",
             zorder=style["zorder"],
+        )
+
+    connection_points = _main_truss_connection_points(layout)
+    if connection_points:
+        ax.scatter(
+            [point[0] for point in connection_points],
+            [point[1] for point in connection_points],
+            marker="o",
+            s=14,
+            facecolors="#ffffff",
+            edgecolors="#111827",
+            linewidths=0.7,
+            zorder=9,
         )
 
     if layout.get("pillars"):

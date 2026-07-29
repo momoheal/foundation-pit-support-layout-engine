@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, Polygon
+from shapely.strtree import STRtree
 
 
 LEGACY_SEGMENT_KEYS = ("struts", "corners", "ties")
@@ -97,13 +98,20 @@ def find_illegal_intersections(
 ) -> list[ValidationIssue]:
     allowed = allowed_crossings or ALLOWED_CROSSINGS
     refs = collect_segments(layout)
+    lines = [ref.line for ref in refs]
+    tree = STRtree(lines) if lines else None
     issues: list[ValidationIssue] = []
 
     for i, left in enumerate(refs):
-        for right in refs[i + 1:]:
+        assert tree is not None
+        for right_index in tree.query(lines[i]):
+            right_index = int(right_index)
+            if right_index <= i:
+                continue
+            right = refs[right_index]
             if frozenset((left.kind, right.kind)) in allowed:
                 continue
-            inter = left.line.intersection(right.line)
+            inter = lines[i].intersection(lines[right_index])
             if inter.is_empty:
                 continue
             points = _points_from_intersection(inter)
@@ -139,7 +147,7 @@ def has_explicit_connection_node(
         pos = node.get("pos")
         if pos is None or not points_close((float(pos[0]), float(pos[1])), point, tol):
             continue
-        if not any(kind in node.get("kind", "") for kind in ("truss_node", "strut_cross", "ring_radial")):
+        if not any(kind in node.get("kind", "") for kind in ("truss_node", "strut_cross", "ring_radial", "tie_end")):
             continue
         if member_ids <= set(node.get("source", [])):
             return True
@@ -182,9 +190,30 @@ def validate_connection_spacing(
     """Warn when same-axis main strut spacing is outside the recommended range."""
     if not params:
         return []
+    if _is_large_brace_layout(layout, params):
+        return []
     min_spacing = float(params.get("spacing_min", 6.0))
     max_spacing = float(params.get("spacing_max", 9.0))
-    main = [ref for ref in collect_segments(layout) if ref.kind == "main_strut"]
+    logical_main: dict[str, SegmentRef] = {}
+    for ref in collect_segments(layout):
+        if ref.kind != "main_strut":
+            continue
+        member = next(
+            (item for item in layout.get("members", []) if item.get("id") == ref.member_id),
+            None,
+        )
+        logical_id = str((member or {}).get("parent_member_id", ref.member_id))
+        geometry = (member or {}).get("logical_geometry")
+        logical_main.setdefault(
+            logical_id,
+            SegmentRef(
+                "main_strut",
+                ref.index,
+                tuple((float(x), float(y)) for x, y in geometry) if geometry else ref.points,
+                logical_id,
+            ),
+        )
+    main = list(logical_main.values())
     vertical = []
     horizontal = []
     for ref in main:
@@ -211,11 +240,268 @@ def validate_connection_spacing(
     return issues
 
 
+def validate_member_bounds(
+    layout: dict[str, Any],
+    params: dict[str, Any] | None,
+) -> list[ValidationIssue]:
+    _ = params
+    if not layout.get("waling"):
+        return []
+    boundary = Polygon(layout["waling"])
+    if boundary.is_empty or not boundary.is_valid:
+        return [ValidationIssue("waling", None, None, None, "invalid_waling")]
+    issues: list[ValidationIssue] = []
+    for ref in collect_segments(layout):
+        if not boundary.buffer(1e-6).covers(ref.line):
+            midpoint = ref.line.interpolate(0.5, normalized=True)
+            issues.append(ValidationIssue(
+                ref.kind,
+                ref.member_id,
+                None,
+                (float(midpoint.x), float(midpoint.y)),
+                "member_outside_waling",
+            ))
+    return issues
+
+
+def validate_member_endpoint_anchors(
+    layout: dict[str, Any],
+    params: dict[str, Any] | None,
+) -> list[ValidationIssue]:
+    tol = float((params or {}).get("node_snap_tolerance", 1e-3))
+    nodes = {str(node.get("id")): node for node in layout.get("nodes", [])}
+    issues: list[ValidationIssue] = []
+    for member in layout.get("members", []):
+        geometry = member.get("geometry", [])
+        if len(geometry) < 2:
+            continue
+        invalid = False
+        for key, point in (("start", geometry[0]), ("end", geometry[-1])):
+            node = nodes.get(str(member.get(key)))
+            if node is None or Point(node["pos"]).distance(Point(point)) > tol:
+                invalid = True
+                break
+            if str(member.get("id")) not in {str(source) for source in node.get("source", [])}:
+                invalid = True
+                break
+        if invalid:
+            issues.append(ValidationIssue(
+                str(member.get("kind", "unknown")),
+                str(member.get("id")),
+                None,
+                (float(geometry[0][0]), float(geometry[0][1])),
+                "member_endpoint_unanchored",
+            ))
+    return issues
+
+
+def validate_structural_connectivity(
+    layout: dict[str, Any],
+    params: dict[str, Any] | None,
+) -> list[ValidationIssue]:
+    _ = params
+    members = layout.get("members", [])
+    adjacency: dict[str, set[str]] = {}
+    seeds: set[str] = set()
+    for member in members:
+        start, end = str(member.get("start")), str(member.get("end"))
+        adjacency.setdefault(start, set()).add(end)
+        adjacency.setdefault(end, set()).add(start)
+        if member.get("kind") == "waling":
+            seeds.update((start, end))
+    if not seeds:
+        return [ValidationIssue("waling", None, None, None, "waling_graph_missing")]
+    reachable = set(seeds)
+    pending = list(seeds)
+    while pending:
+        node = pending.pop()
+        for neighbour in adjacency.get(node, set()):
+            if neighbour not in reachable:
+                reachable.add(neighbour)
+                pending.append(neighbour)
+    return [
+        ValidationIssue(
+            str(member.get("kind", "unknown")),
+            str(member.get("id")),
+            None,
+            None,
+            "structural_component_not_waling_reachable",
+        )
+        for member in members
+        if str(member.get("start")) not in reachable or str(member.get("end")) not in reachable
+    ]
+
+
+def validate_large_brace_topology(
+    layout: dict[str, Any],
+    params: dict[str, Any] | None,
+) -> list[ValidationIssue]:
+    if not params or params.get("support_system") != "brace" or not layout.get("waling"):
+        return []
+    min_x, min_y, max_x, max_y = Polygon(layout["waling"]).bounds
+    if max_x - min_x < 100.0 or max_y - min_y < 60.0:
+        return []
+    logical: dict[str, list[tuple[float, float]]] = {}
+    for member in layout.get("members", []):
+        if member.get("kind") != "main_strut":
+            continue
+        logical.setdefault(
+            str(member.get("parent_member_id", member.get("id"))),
+            [(float(x), float(y)) for x, y in member.get("logical_geometry", member["geometry"])],
+        )
+    vertical = sorted({round(points[0][0], 6) for points in logical.values() if abs(points[0][0] - points[-1][0]) <= 1e-6})
+    horizontal = sorted({round(points[0][1], 6) for points in logical.values() if abs(points[0][1] - points[-1][1]) <= 1e-6})
+    pair_gaps: list[float] = []
+    if len(vertical) == 4:
+        pair_gaps.extend((vertical[1] - vertical[0], vertical[3] - vertical[2]))
+    if len(horizontal) == 2:
+        pair_gaps.append(horizontal[1] - horizontal[0])
+    if len(vertical) == 4 and len(horizontal) == 2 and all(6.0 - 1e-6 <= gap <= 8.0 + 1e-6 for gap in pair_gaps):
+        return []
+    return [ValidationIssue(
+        "main_strut",
+        None,
+        None,
+        None,
+        f"large_brace_main_group_topology:vertical={len(vertical)},horizontal={len(horizontal)}",
+    )]
+
+
+def validate_large_brace_clearance(
+    layout: dict[str, Any],
+    params: dict[str, Any] | None,
+) -> list[ValidationIssue]:
+    if not params or params.get("support_system") != "brace" or not layout.get("waling"):
+        return []
+    min_x, min_y, max_x, max_y = Polygon(layout["waling"]).bounds
+    if max_x - min_x < 100.0 or max_y - min_y < 60.0:
+        return []
+
+    important = [
+        node for node in layout.get("nodes", [])
+        if "strut_cross" in str(node.get("kind", ""))
+        and "tie_end" not in str(node.get("kind", ""))
+    ]
+    issues: list[ValidationIssue] = []
+    for index, left in enumerate(important):
+        for right in important[index + 1:]:
+            distance = Point(left["pos"]).distance(Point(right["pos"]))
+            if distance < 3.0 - 1e-6:
+                issues.append(ValidationIssue(
+                    "node",
+                    None,
+                    None,
+                    (float(left["pos"][0]), float(left["pos"][1])),
+                    f"important_node_clearance_below_3m:{distance:.3f}",
+                ))
+
+    logical: dict[str, tuple[str, LineString]] = {}
+    for member in layout.get("members", []):
+        if member.get("kind") not in {"main_strut", "tie", "corner"}:
+            continue
+        logical_id = str(member.get("parent_member_id", member.get("id")))
+        geometry = member.get("logical_geometry", member.get("geometry", []))
+        if len(geometry) >= 2:
+            logical.setdefault(logical_id, (str(member["kind"]), LineString(geometry)))
+    items = list(logical.items())
+    for index, (left_id, (left_kind, left)) in enumerate(items):
+        left_dx = left.coords[-1][0] - left.coords[0][0]
+        left_dy = left.coords[-1][1] - left.coords[0][1]
+        for right_id, (right_kind, right) in items[index + 1:]:
+            if left_kind != right_kind:
+                continue
+            right_dx = right.coords[-1][0] - right.coords[0][0]
+            right_dy = right.coords[-1][1] - right.coords[0][1]
+            scale = max(left.length * right.length, 1e-9)
+            if abs(left_dx * right_dy - left_dy * right_dx) / scale > 1e-6:
+                continue
+            distance = left.distance(right)
+            if distance < 3.0 - 1e-6:
+                issues.append(ValidationIssue(
+                    left_kind,
+                    left_id,
+                    right_id,
+                    None,
+                    f"parallel_member_clearance_below_3m:{distance:.3f}",
+                ))
+    return issues
+
+
+def validate_perimeter_truss_continuity(
+    layout: dict[str, Any],
+    params: dict[str, Any] | None,
+) -> list[ValidationIssue]:
+    if not params or params.get("support_system") not in {"brace", "straight_truss"}:
+        return []
+    if not layout.get("waling"):
+        return []
+
+    waling_line = LineString(layout["waling"])
+    if waling_line.length <= 1e-9:
+        return []
+
+    truss_refs = [
+        ref for ref in collect_segments(layout)
+        if ref.kind in {"truss_chord", "truss_web"}
+    ]
+    if not truss_refs:
+        if params.get("support_system") == "brace":
+            return []
+        return [ValidationIssue(
+            "truss_chord",
+            None,
+            None,
+            None,
+            "perimeter_truss_missing",
+            "error",
+        )]
+
+    if _is_large_brace_layout(layout, params):
+        waling = LineString(layout["waling"])
+        edge_panels = [
+            ref.line.length
+            for ref in truss_refs
+            if ref.kind == "truss_chord"
+            and waling.distance(ref.line.interpolate(0.5, normalized=True)) <= 1e-6
+        ]
+        panel_max = float(params.get("truss_panel_max", params.get("spacing_max", 9.0)))
+        if edge_panels and max(edge_panels) <= panel_max + 1e-6:
+            return []
+        return [ValidationIssue(
+            "truss_chord",
+            None,
+            None,
+            None,
+            "perimeter_edge_panel_exceeds_max",
+            "warning",
+        )]
+
+    max_gap = _max_perimeter_truss_gap(layout, params)
+    panel_max = float(params.get("truss_panel_max", params.get("spacing_max", 9.0)))
+    if max_gap > panel_max + 1e-6:
+        point = waling_line.interpolate(min(max_gap / 2.0, waling_line.length), normalized=False)
+        return [ValidationIssue(
+            "truss_chord",
+            None,
+            None,
+            (float(point.x), float(point.y)),
+            f"perimeter_truss_gap:{max_gap:.3f}",
+            "warning",
+        )]
+    return []
+
+
 def validate_layout(layout: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
     issues = []
+    issues.extend(validate_member_bounds(layout, params))
+    issues.extend(validate_member_endpoint_anchors(layout, params))
+    issues.extend(validate_structural_connectivity(layout, params))
+    issues.extend(validate_large_brace_topology(layout, params))
+    issues.extend(validate_large_brace_clearance(layout, params))
     issues.extend(find_illegal_intersections(layout))
     issues.extend(validate_core_protection(layout, params))
     issues.extend(validate_connection_spacing(layout, params))
+    issues.extend(validate_perimeter_truss_continuity(layout, params))
 
     issue_dicts = [asdict(issue) for issue in issues]
     return {
@@ -248,3 +534,39 @@ def _points_from_intersection(geom: Any) -> list[tuple[float, float]]:
             points.extend(_points_from_intersection(part))
         return points
     return []
+
+
+def _max_perimeter_truss_gap(layout: dict[str, Any], params: dict[str, Any]) -> float:
+    waling_line = LineString(layout["waling"])
+    if waling_line.length <= 1e-9:
+        return float("inf")
+
+    search_band = max(
+        float(params.get("truss_depth", 0.8)) * 4.0,
+        float(params.get("truss_panel_max", params.get("spacing_max", 9.0))) * 1.5,
+    )
+    positions = [0.0, waling_line.length]
+    for ref in collect_segments(layout):
+        if ref.kind not in {"truss_chord", "truss_web"}:
+            continue
+        if waling_line.distance(ref.line) > search_band:
+            continue
+        for point in ref.points:
+            point_geom = Point(point)
+            if waling_line.distance(point_geom) <= search_band:
+                positions.append(float(waling_line.project(point_geom)))
+        midpoint = ref.line.interpolate(0.5, normalized=True)
+        if waling_line.distance(midpoint) <= search_band:
+            positions.append(float(waling_line.project(midpoint)))
+
+    unique = sorted({round(value, 6) for value in positions})
+    if len(unique) < 2:
+        return float("inf")
+    return max(right - left for left, right in zip(unique, unique[1:]))
+
+
+def _is_large_brace_layout(layout: dict[str, Any], params: dict[str, Any]) -> bool:
+    if params.get("support_system") != "brace" or not layout.get("waling"):
+        return False
+    min_x, min_y, max_x, max_y = Polygon(layout["waling"]).bounds
+    return max_x - min_x >= 100.0 and max_y - min_y >= 60.0

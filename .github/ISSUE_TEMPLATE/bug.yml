@@ -1,0 +1,56 @@
+name: Bug
+description: Report an incorrect software behavior.
+title: "[Bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options: [P0, P1, P2]
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Deterministic command and named case.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: modules
+    attributes:
+      label: Affected modules
+    validations:
+      required: true
+  - type: textarea
+    id: root_cause
+    attributes:
+      label: Root-cause hypothesis
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Include the named regression test.
+    validations:
+      required: true
+  - type: textarea
+    id: commands
+    attributes:
+      label: Acceptance commands
+    validations:
+      required: true

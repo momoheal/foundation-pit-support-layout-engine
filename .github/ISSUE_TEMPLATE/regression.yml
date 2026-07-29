@@ -1,0 +1,64 @@
+name: Regression
+description: Report a previously accepted behavior that failed again.
+title: "[Regression] "
+labels: ["regression", "needs-triage"]
+body:
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options: [P0, P1, P2]
+    validations:
+      required: true
+  - type: input
+    id: related_issue
+    attributes:
+      label: Related closed Issue or accepted commit
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Previously accepted behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Current behavior
+    validations:
+      required: true
+  - type: textarea
+    id: modules
+    attributes:
+      label: Affected modules
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Name the regression test that will remain in the suite.
+    validations:
+      required: true
+  - type: textarea
+    id: commands
+    attributes:
+      label: Acceptance commands
+      value: |-
+        python -m pytest test_strut_minimal.py -v
+        python run_engineering_strut_checks.py
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: DXF and PNG evidence paths
+    validations:
+      required: true

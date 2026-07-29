@@ -1,11 +1,13 @@
 [tool.pytest.ini_options]
-testpaths = ["test_strut_minimal.py"]
+testpaths = ["test_strut_minimal.py", "test_structural_red_lines.py", "test_issue_management.py"]
+cache_dir = ".pytest_cache"
 
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
 check_untyped_defs = false
 warn_unused_ignores = true
+cache_dir = ".mypy_cache"
 
 [tool.ruff]
 line-length = 100

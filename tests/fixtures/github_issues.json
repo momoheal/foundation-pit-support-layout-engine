@@ -1,0 +1,20 @@
+[
+  {
+    "number": 12,
+    "title": "Disconnected tie graph",
+    "state": "OPEN",
+    "url": "https://github.com/example/repo/issues/12",
+    "labels": [{"name": "P0"}, {"name": "engineering"}, {"name": "in-progress"}],
+    "assignees": [{"login": "engineer"}],
+    "body": "### Affected modules\nstrut_engine.py, strut_validation.py\n\n### Acceptance commands\npython -m pytest test_strut_minimal.py -v\npython run_engineering_strut_checks.py"
+  },
+  {
+    "number": 9,
+    "title": "Index rendering typo",
+    "state": "CLOSED",
+    "url": "https://github.com/example/repo/issues/9",
+    "labels": [{"name": "P2"}, {"name": "bug"}],
+    "assignees": [],
+    "body": "### Affected modules\ntools/sync_issue_index.py\n\n### Acceptance commands\npython -m pytest test_issue_management.py -v"
+  }
+]

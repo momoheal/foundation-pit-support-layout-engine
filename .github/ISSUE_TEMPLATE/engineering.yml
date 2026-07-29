@@ -1,0 +1,65 @@
+name: Engineering defect
+description: Report an implausible support layout or load path.
+title: "[Engineering] "
+labels: ["engineering", "needs-triage"]
+body:
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options: [P0, P1, P2]
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Deterministic command and named engineering case.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected structural behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual structural behavior
+    validations:
+      required: true
+  - type: textarea
+    id: modules
+    attributes:
+      label: Affected modules
+    validations:
+      required: true
+  - type: textarea
+    id: risk
+    attributes:
+      label: Engineering risk and root-cause hypothesis
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Name the regression test and required topology checks.
+    validations:
+      required: true
+  - type: textarea
+    id: commands
+    attributes:
+      label: Acceptance commands
+      value: |-
+        python -m pytest test_strut_minimal.py -v
+        python run_engineering_strut_checks.py
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: DXF and PNG evidence paths
+    validations:
+      required: true
