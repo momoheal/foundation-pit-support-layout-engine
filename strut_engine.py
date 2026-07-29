@@ -181,6 +181,10 @@ class StrutEngine:
             params["node_snap_tolerance"],
             params["min_node_separation"],
         )
+        params["corner_truss_tier_count"] = max(
+            1,
+            int(round(params["corner_truss_tier_count"])),
+        )
 
         system = str(params["support_system"]).strip()
         if system not in SUPPORT_SYSTEMS:
@@ -233,6 +237,7 @@ class StrutEngine:
 
         self._merge_nearby_nodes(layout)
         self._planarize_structural_members(layout)
+        self._merge_nearby_nodes(layout)
         self._attach_stats(layout)
         self._attach_validation(layout)
         return layout
@@ -266,8 +271,8 @@ class StrutEngine:
         waling_poly = self._place_waling(layout)
         if self._uses_large_corner_truss(waling_poly):
             struts = self._place_main_struts_avoiding_corner_coverage(layout, waling_poly)
-            corner_model = self._large_brace_corner_anchor_model(layout, waling_poly)
-            self._place_large_brace_perimeter_truss(layout, waling_poly, corner_model)
+            corner_model = self._place_discrete_edge_trusses(layout, waling_poly)
+            self._place_modular_corner_assemblies(layout, waling_poly, corner_model)
             self._place_perimeter_truss_stiffening(layout, waling_poly)
             self._place_truss_coupling_ties(layout, struts, waling_poly)
         else:
@@ -294,8 +299,13 @@ class StrutEngine:
     def solve_straight_truss(self, layout: dict[str, Any]) -> None:
         waling_poly = self._place_waling(layout)
         struts = self._place_main_struts(layout, waling_poly, include_x=True, include_y=True)
-        corner_model = self._large_brace_corner_anchor_model(layout, waling_poly)
-        self._place_large_brace_perimeter_truss(layout, waling_poly, corner_model)
+        corner_model = self._place_discrete_edge_trusses(layout, waling_poly)
+        replaced_ids = set(corner_model.get("replaced_main_strut_ids", []))
+        struts = [
+            item for item in struts
+            if str(item["member"]["id"]) not in replaced_ids
+        ]
+        self._place_modular_corner_assemblies(layout, waling_poly, corner_model)
         self._place_perimeter_truss_stiffening(layout, waling_poly)
         self._place_straight_truss(layout, struts, waling_poly)
         self._place_single_direction_ties(layout, struts, waling_poly)
@@ -325,6 +335,9 @@ class StrutEngine:
         waling_poly = self._waling_poly()
         coords = _closed_coords(list(waling_poly.exterior.coords))
         layout["waling"] = coords
+        roles = ["waling"]
+        if self.params["support_system"] in {"brace", "straight_truss"}:
+            roles.append("edge_truss_outer_chord")
         self._add_member(
             layout,
             kind="waling",
@@ -332,6 +345,7 @@ class StrutEngine:
             width=self.params["waling_width"],
             node_kind="waling_point",
             closed=True,
+            attributes={"structural_roles": roles},
         )
         return waling_poly
 
@@ -487,119 +501,257 @@ class StrutEngine:
                 zones.append(zone)
         return zones
 
-    def _place_large_brace_perimeter_truss(
+    def _place_discrete_edge_trusses(
         self,
         layout: dict[str, Any],
         waling_poly: Polygon,
-        corner_model: dict[str, Any],
-    ) -> None:
-        """Build edge panels and setback corner lattices as one connected band."""
-        corners = corner_model.get("corners", [])
+    ) -> dict[str, Any]:
+        """Build one straight inner chord and middle web field per waling edge."""
+        corners = _open_coords(_closed_coords(list(waling_poly.exterior.coords)))
         if len(corners) < 3:
-            return
+            return {"corners": [], "inner_lines": []}
         centroid = (float(waling_poly.centroid.x), float(waling_poly.centroid.y))
         panel_max = float(self.params["truss_panel_max"])
-        depth = self._edge_truss_depth()
+        configured_spacing = self.params.get("corner_truss_tier_spacing")
+        depth = (
+            float(configured_spacing)
+            if configured_spacing is not None
+            else max(
+                self._edge_truss_depth(),
+                float(self.params["spacing_min"]) * 0.75,
+                float(self.params["min_tie_to_strut_clearance"]) * (2.0 ** 0.5),
+            )
+        )
+        requested_tiers = int(self.params["corner_truss_tier_count"])
+        inner_lines: list[Geometry] = []
 
-        for index, start_corner in enumerate(corners):
-            end_corner = corners[(index + 1) % len(corners)]
-            outer_start = start_corner["next_anchor"]
-            outer_end = end_corner["prev_anchor"]
+        for index, outer_start in enumerate(corners):
+            outer_end = corners[(index + 1) % len(corners)]
+            edge_id = f"edge_truss_{index + 1}"
             edge = LineString([outer_start, outer_end])
             if edge.length <= 1e-9:
+                inner_lines.append([])
                 continue
             inward = _inward_unit_normal(outer_start, outer_end, centroid)
             inner_start = _offset_point(outer_start, inward, depth)
             inner_end = _offset_point(outer_end, inward, depth)
-            stations = [0.0, edge.length]
+            inner_geometry = [inner_start, inner_end]
+            inner_lines.append(inner_geometry)
+
+        replaced_main_strut_ids = {
+            str(member["id"])
+            for member in layout["members"]
+            if member["kind"] == "main_strut"
+            and (
+                any(
+                    _segments_nearly_parallel(member["geometry"], inner_geometry)
+                    and LineString(member["geometry"]).distance(LineString(inner_geometry))
+                    < float(self.params["min_node_separation"]) - 1e-9
+                    for inner_geometry in inner_lines
+                    if len(inner_geometry) >= 2
+                )
+                or any(
+                    waling_poly.exterior.distance(Point(endpoint)) <= 1e-6
+                    and min(Point(endpoint).distance(Point(corner)) for corner in corners)
+                    < requested_tiers * depth - 1e-6
+                    for endpoint in (member["geometry"][0], member["geometry"][-1])
+                )
+            )
+        }
+        self._remove_layout_members(layout, replaced_main_strut_ids)
+
+        for index, inner_geometry in enumerate(inner_lines):
+            if len(inner_geometry) < 2:
+                continue
+            outer_start = corners[index]
+            outer_end = corners[(index + 1) % len(corners)]
+            edge_id = f"edge_truss_{index + 1}"
+            edge = LineString([outer_start, outer_end])
+            inward = _unit_vector(outer_start, inner_geometry[0])
+            adjacent_assemblies = [
+                f"corner_bracket_{index + 1}",
+                f"corner_bracket_{(index + 1) % len(corners) + 1}",
+            ]
+            self._add_linear_member(
+                layout,
+                "truss_chord",
+                inner_geometry,
+                old_key=None,
+                node_kind="truss_node",
+                attributes={
+                    "edge_truss_id": edge_id,
+                    "edge_role": "inner_chord",
+                    "corner_assemblies": adjacent_assemblies,
+                },
+            )
+
+            corner_reach = min(requested_tiers * depth, edge.length / 2.0)
+            stations = [corner_reach, edge.length - corner_reach]
             for member in layout["members"]:
                 if member["kind"] != "main_strut":
                     continue
                 for point in (member["geometry"][0], member["geometry"][-1]):
                     if edge.distance(Point(point)) <= 1e-6:
-                        stations.append(edge.project(Point(point)))
-            nodes: list[Point2D] = []
-            unique_stations = sorted({round(value, 6) for value in stations})
+                        distance = edge.project(Point(point))
+                        if corner_reach < distance < edge.length - corner_reach:
+                            stations.append(distance)
+            outer_nodes: list[Point2D] = []
+            unique_stations = sorted({round(float(value), 6) for value in stations})
             for left, right in zip(unique_stations, unique_stations[1:]):
                 count = max(1, int(ceil((right - left) / panel_max)))
                 for step in range(count):
                     distance = left + (right - left) * step / count
                     point = edge.interpolate(distance)
                     candidate = (round(float(point.x), 6), round(float(point.y), 6))
-                    if not nodes or not _points_close(nodes[-1], candidate):
-                        nodes.append(candidate)
-            nodes.append(outer_end)
-            inner_nodes = [_offset_point(point, inward, depth) for point in nodes]
+                    if not outer_nodes or not _points_close(outer_nodes[-1], candidate):
+                        outer_nodes.append(candidate)
+            end_point = edge.interpolate(edge.length - corner_reach)
+            outer_nodes.append((round(float(end_point.x), 6), round(float(end_point.y), 6)))
+            outer_nodes = self._align_edge_main_anchor_parity(
+                layout,
+                outer_nodes,
+                outer_start,
+                outer_end,
+            )
+            inner_nodes = [_offset_point(point, inward, depth) for point in outer_nodes]
             for panel_index, (outer_a, outer_b, inner_a, inner_b) in enumerate(zip(
-                nodes,
-                nodes[1:],
+                outer_nodes,
+                outer_nodes[1:],
                 inner_nodes,
                 inner_nodes[1:],
             )):
-                attributes: dict[str, Any] = {"truss_primitive": "panel"}
-                if panel_index == 0:
-                    attributes.update({
-                        "belongs_to_corner_bracket": start_corner["assembly_id"],
-                        "corner_role": "edge_panel",
-                    })
-                elif panel_index == len(nodes) - 2:
-                    attributes.update({
-                        "belongs_to_corner_bracket": end_corner["assembly_id"],
-                        "corner_role": "edge_panel",
-                    })
-                specs = self._truss_panel_member_specs(
-                    outer_a,
-                    outer_b,
-                    inner_a,
-                    inner_b,
-                    start_on_outer=panel_index % 2 == 0,
-                    end_on_outer=panel_index % 2 != 0,
+                web = [outer_a, inner_b] if panel_index % 2 == 0 else [inner_a, outer_b]
+                covering_main = next((
+                    member for member in layout["members"]
+                    if member["kind"] == "main_strut"
+                    and LineString(member["geometry"]).buffer(1e-6).covers(LineString(web))
+                ), None)
+                if covering_main is not None:
+                    roles = set(covering_main.get("structural_roles", []))
+                    roles.add("edge_truss_web")
+                    covering_main["structural_roles"] = sorted(roles)
+                    covering_main.setdefault("edge_truss_web_segments", []).append(web)
+                    covering_main.setdefault("edge_truss_ids", []).append(edge_id)
+                    continue
+                self._add_linear_member(
+                    layout,
+                    "truss_web",
+                    web,
+                    old_key=None,
+                    node_kind="truss_node",
+                    attributes={
+                        "edge_truss_id": edge_id,
+                        "edge_role": "web",
+                        "truss_primitive": "panel",
+                    },
                 )
-                for kind, geometry in specs:
-                    self._add_linear_member(
-                        layout,
-                        kind,
-                        geometry,
-                        old_key=None,
-                        node_kind="truss_node",
-                        attributes=attributes,
-                    )
 
-        for corner in corners:
-            attributes = {
-                "belongs_to_corner_bracket": corner["assembly_id"],
-                "corner_role": "leg",
-                "truss_primitive": "panel",
-            }
-            outer_start = corner["prev_anchor"]
-            outer_end = corner["next_anchor"]
-            inner_start = corner["prev_inner_anchor"]
-            inner_end = corner["next_inner_anchor"]
-            outer = LineString([outer_start, outer_end])
-            inner = LineString([inner_start, inner_end])
-            count = max(1, int(ceil(max(outer.length, inner.length) / panel_max)))
-            for panel_index in range(count):
-                ratio_a = panel_index / count
-                ratio_b = (panel_index + 1) / count
-                outer_a = _interpolate_point(outer_start, outer_end, ratio_a)
-                outer_b = _interpolate_point(outer_start, outer_end, ratio_b)
-                inner_a = _interpolate_point(inner_start, inner_end, ratio_a)
-                inner_b = _interpolate_point(inner_start, inner_end, ratio_b)
-                for kind, geometry in self._truss_panel_member_specs(
-                    outer_a,
-                    outer_b,
-                    inner_a,
-                    inner_b,
-                    start_on_outer=panel_index % 2 == 0,
-                    end_on_outer=panel_index % 2 != 0,
+        corner_models: list[dict[str, Any]] = []
+        for index, corner in enumerate(corners):
+            prev_pt = corners[index - 1]
+            next_pt = corners[(index + 1) % len(corners)]
+            if not _is_convex_corner(prev_pt, corner, next_pt, waling_poly):
+                continue
+            prev_inner = inner_lines[index - 1]
+            next_inner = inner_lines[index]
+            if len(prev_inner) < 2 or len(next_inner) < 2:
+                continue
+            intersection = LineString(prev_inner).intersection(LineString(next_inner))
+            if not isinstance(intersection, Point):
+                continue
+            corner_models.append({
+                "assembly_id": f"corner_bracket_{index + 1}",
+                "corner": corner,
+                "prev_direction": _unit_vector(corner, prev_pt),
+                "next_direction": _unit_vector(corner, next_pt),
+                "prev_length": Point(corner).distance(Point(prev_pt)),
+                "next_length": Point(corner).distance(Point(next_pt)),
+                "prev_inner": prev_inner,
+                "next_inner": next_inner,
+                "inner_common": (float(intersection.x), float(intersection.y)),
+            })
+        return {
+            "corners": corner_models,
+            "inner_lines": inner_lines,
+            "depth": depth,
+            "replaced_main_strut_ids": sorted(replaced_main_strut_ids),
+        }
+
+    def _place_modular_corner_assemblies(
+        self,
+        layout: dict[str, Any],
+        waling_poly: Polygon,
+        corner_model: dict[str, Any],
+    ) -> None:
+        """Place modular waling-to-waling tiers and recurrence webs."""
+        _ = waling_poly
+        default_spacing = float(corner_model.get("depth", self._edge_truss_depth()))
+        configured_spacing = self.params.get("corner_truss_tier_spacing")
+        spacing = float(configured_spacing) if configured_spacing is not None else default_spacing
+        requested = int(self.params["corner_truss_tier_count"])
+
+        for corner in corner_model.get("corners", []):
+            legal_count = int(min(corner["prev_length"], corner["next_length"]) // spacing)
+            tier_count = min(requested, legal_count)
+            if tier_count < 1:
+                continue
+            assembly_id = str(corner["assembly_id"])
+            vertex = corner["corner"]
+            prev_direction = corner["prev_direction"]
+            next_direction = corner["next_direction"]
+            prev_anchors = [
+                _offset_point(vertex, prev_direction, spacing * tier)
+                for tier in range(1, tier_count + 1)
+            ]
+            next_anchors = [
+                _offset_point(vertex, next_direction, spacing * tier)
+                for tier in range(1, tier_count + 1)
+            ]
+            for tier, (prev_anchor, next_anchor) in enumerate(
+                zip(prev_anchors, next_anchors),
+                start=1,
+            ):
+                tier_geometry = [prev_anchor, next_anchor]
+                common_attributes = {
+                    "belongs_to_corner_bracket": assembly_id,
+                    "corner_role": f"tier_{tier}",
+                    "corner_inner_common": corner["inner_common"],
+                    "truss_primitive": "corner_tier",
+                    "tier_index": tier,
+                }
+                self._add_linear_member(
+                    layout,
+                    "truss_web",
+                    tier_geometry,
+                    old_key=None,
+                    node_kind="truss_node",
+                    attributes=common_attributes,
+                )
+                if tier < 3:
+                    continue
+                tier_line = LineString(tier_geometry)
+                for inner_geometry, previous_anchor in (
+                    (corner["prev_inner"], prev_anchors[tier - 2]),
+                    (corner["next_inner"], next_anchors[tier - 2]),
                 ):
+                    crossing = tier_line.intersection(LineString(inner_geometry))
+                    if not isinstance(crossing, Point):
+                        continue
+                    crossing_point = (float(crossing.x), float(crossing.y))
                     self._add_linear_member(
                         layout,
-                        kind,
-                        geometry,
+                        "truss_web",
+                        [crossing_point, previous_anchor],
                         old_key=None,
                         node_kind="truss_node",
-                        attributes=attributes,
+                        attributes={
+                            "belongs_to_corner_bracket": assembly_id,
+                            "corner_role": f"tier_{tier}_perpendicular_web",
+                            "truss_primitive": "corner_recurrence_web",
+                            "tier_index": tier,
+                            "tier_crossing": crossing_point,
+                            "previous_waling_anchor": previous_anchor,
+                        },
                     )
 
     def _place_grouped_main_struts(
@@ -719,8 +871,8 @@ class StrutEngine:
             q1, q2 = right["member"]["geometry"][0], right["member"]["geometry"][-1]
             y_low = max(min(p1[1], p2[1]), min(q1[1], q2[1]))
             y_high = min(max(p1[1], p2[1]), max(q1[1], q2[1]))
-            unsupported_span = y_high - y_low
-            if unsupported_span < max(panel, float(self.params["truss_min_span"])):
+            unsupported_span = y_high - y_low - 2.0 * float(self.params["waling_offset"])
+            if unsupported_span <= max(panel, float(self.params["truss_min_span"])):
                 continue
             x_left = p1[0]
             x_right = q1[0]
@@ -984,115 +1136,27 @@ class StrutEngine:
         layout: dict[str, Any],
         waling_poly: Polygon,
     ) -> None:
-        chord_members = [
-            member for member in layout["members"]
-            if member["kind"] == "truss_chord"
-        ]
-        outer_points = _dedup_points([
-            endpoint
-            for member in chord_members
-            for endpoint in (member["geometry"][0], member["geometry"][-1])
-            if waling_poly.exterior.distance(Point(endpoint)) <= 1e-6
-        ], 1e-6)
-        inner_points = _dedup_points([
-            endpoint
-            for member in chord_members
-            for endpoint in (member["geometry"][0], member["geometry"][-1])
-            if waling_poly.exterior.distance(Point(endpoint)) > 1e-6
-        ], 1e-6)
-        waling_edges = [
-            LineString([start, end])
-            for start, end in zip(
-                _open_coords(layout["waling"]),
-                _open_coords(layout["waling"])[1:] + _open_coords(layout["waling"])[:1],
-            )
-        ]
-
         for main in [member for member in layout["members"] if member["kind"] == "main_strut"]:
-            main_line = LineString(main["geometry"])
             for outer_point in main["geometry"]:
                 if waling_poly.exterior.distance(Point(outer_point)) > 1e-6:
                     continue
-                inner_candidates = [
-                    point for point in inner_points
-                    if main_line.distance(Point(point)) <= 1e-6
+                adjacent_webs = [
+                    member for member in layout["members"]
+                    if member["kind"] == "truss_web"
+                    and member.get("edge_role") == "web"
+                    and any(
+                        _points_close(point, outer_point, tol=1e-6)
+                        for point in (member["geometry"][0], member["geometry"][-1])
+                    )
                 ]
-                if not inner_candidates:
-                    continue
-                inner_point = min(
-                    inner_candidates,
-                    key=lambda point: Point(point).distance(Point(outer_point)),
-                )
-                outer_neighbors = sorted(
-                    (
-                        point for point in outer_points
-                        if not _points_close(point, outer_point, tol=1e-6)
-                        and any(
-                            edge.distance(Point(outer_point)) <= 1e-6
-                            and edge.distance(Point(point)) <= 1e-6
-                            for edge in waling_edges
-                        )
-                    ),
-                    key=lambda point: Point(point).distance(Point(outer_point)),
-                )
-                cell: tuple[Point2D, Point2D] | None = None
-                for outer_neighbor in outer_neighbors:
-                    paired_inner = min(
-                        inner_points,
-                        key=lambda point: Point(point).distance(Point(outer_neighbor)),
-                    )
-                    if _points_close(paired_inner, inner_point, tol=1e-6):
-                        continue
-                    diagonals = (
-                        [outer_point, paired_inner],
-                        [inner_point, outer_neighbor],
-                    )
-                    if all(waling_poly.buffer(1e-6).covers(LineString(diagonal)) for diagonal in diagonals):
-                        cell = (outer_neighbor, paired_inner)
-                        break
-                if cell is None:
-                    continue
-
-                outer_neighbor, paired_inner = cell
-                attributes = {
-                    "truss_primitive": "panel",
-                    "stiffening_at": main["id"],
-                    "stiffening_for": [main["id"]],
-                    "stiffening_point": tuple(outer_point),
-                    "stiffening_points": [tuple(outer_point)],
-                }
-                for geometry in (
-                    [outer_point, paired_inner],
-                    [inner_point, outer_neighbor],
-                ):
-                    existing = next((
-                        member for member in layout["members"]
-                        if member["kind"] == "truss_web"
-                        and LineString(member["geometry"]).equals(LineString(geometry))
-                    ), None)
-                    if existing is not None:
-                        prior = existing.get("stiffening_for", [existing.get("stiffening_at")])
-                        existing["stiffening_for"] = sorted({
-                            str(member_id)
-                            for member_id in [*prior, main["id"]]
-                            if member_id is not None
-                        })
-                        prior_points = existing.get(
-                            "stiffening_points",
-                            [existing.get("stiffening_point")],
-                        )
-                        existing["stiffening_points"] = _dedup_points(
-                            [point for point in [*prior_points, tuple(outer_point)] if point is not None],
-                            1e-6,
-                        )
-                        continue
-                    self._add_linear_member(
-                        layout,
-                        "truss_web",
-                        geometry,
-                        old_key=None,
-                        node_kind="truss_node",
-                        attributes=attributes,
+                for web in adjacent_webs:
+                    web["stiffening_for"] = sorted({
+                        *web.get("stiffening_for", []),
+                        str(main["id"]),
+                    })
+                    web["stiffening_points"] = _dedup_points(
+                        [*web.get("stiffening_points", []), tuple(outer_point)],
+                        1e-6,
                     )
 
     def _candidate_touches_corner(self, candidate: Geometry, corners: Geometry) -> bool:
@@ -1157,16 +1221,14 @@ class StrutEngine:
             return nodes
 
         adjusted = list(nodes)
-        target_parity: int | None = None
+        target_parity = 0
         index = 0
         while index < len(adjusted):
             point = adjusted[index]
             if not any(_points_close(point, main_point, tol=1e-6) for main_point in main_points):
                 index += 1
                 continue
-            if target_parity is None:
-                target_parity = index % 2
-            elif index % 2 != target_parity and index > 0:
+            if index % 2 != target_parity and index > 0:
                 previous = adjusted[index - 1]
                 midpoint = (
                     round((previous[0] + point[0]) / 2.0, 6),
@@ -2270,26 +2332,33 @@ class StrutEngine:
                 segment = substring(line, start_distance, end_distance)
                 if not isinstance(segment, LineString) or segment.length <= 1e-9:
                     continue
+                attributes = {
+                    key: value
+                    for key, value in target.items()
+                    if key not in {
+                        "id",
+                        "kind",
+                        "system",
+                        "start",
+                        "end",
+                        "geometry",
+                        "width",
+                        "material",
+                    }
+                }
+                attributes["parent_member_id"] = str(
+                    target.get("parent_member_id", target["id"])
+                )
+                attributes["logical_geometry"] = list(
+                    target.get("logical_geometry", target["geometry"])
+                )
                 self._add_member(
                     layout,
                     target["kind"],
                     [(float(x), float(y)) for x, y in segment.coords],
                     float(target["width"]),
                     node_kind="truss_node",
-                    attributes={
-                        key: value
-                        for key, value in target.items()
-                        if key not in {
-                            "id",
-                            "kind",
-                            "system",
-                            "start",
-                            "end",
-                            "geometry",
-                            "width",
-                            "material",
-                        }
-                    },
+                    attributes=attributes,
                 )
 
     def _place_single_direction_ties(
@@ -2570,6 +2639,31 @@ class StrutEngine:
             for member in layout["members"]
             if member["kind"] == "corner"
         ]
+
+    def _remove_layout_members(
+        self,
+        layout: dict[str, Any],
+        member_ids: set[str],
+    ) -> None:
+        if not member_ids:
+            return
+        layout["members"] = [
+            member for member in layout["members"]
+            if str(member["id"]) not in member_ids
+        ]
+        layout["outlines"] = [
+            outline for outline in layout["outlines"]
+            if str(outline.get("member_id")) not in member_ids
+        ]
+        for node in layout["nodes"]:
+            node["source"] = [
+                member_id for member_id in node.get("source", [])
+                if str(member_id) not in member_ids
+            ]
+        layout["nodes"] = [node for node in layout["nodes"] if node["source"]]
+        self._node_by_id = {str(node["id"]): node for node in layout["nodes"]}
+        self._rebuild_node_index(layout)
+        self._refresh_legacy_buckets(layout)
 
     def _merge_nearby_nodes(self, layout: dict[str, Any]) -> None:
         min_separation = float(self.params["min_node_separation"])

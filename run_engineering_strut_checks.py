@@ -252,15 +252,20 @@ def _check_opposite_strut(case: Case, layout: dict[str, Any]) -> int:
 
 def _check_edge_truss(case: Case, layout: dict[str, Any]) -> int:
     waling_line = LineString(layout["waling"])
-    outer_chord_length = sum(
-        LineString(member["geometry"]).length
-        for member in layout["members"]
+    walings = _logical_members([
+        member for member in layout["members"] if member["kind"] == "waling"
+    ])
+    duplicate_outer_chords = [
+        member for member in _logical_members(layout["members"])
         if member["kind"] == "truss_chord"
-        and waling_line.distance(LineString(member["geometry"]).interpolate(0.5, normalized=True)) < 1e-6
+        and waling_line.buffer(1e-6).covers(LineString(member["geometry"]))
+    ]
+    failures = _check(
+        len(walings) == 1
+        and "edge_truss_outer_chord" in walings[0].get("structural_roles", [])
+        and duplicate_outer_chords == [],
+        "waling is the only physical edge-truss outer chord",
     )
-    coverage = outer_chord_length / waling_line.length if waling_line.length else 0.0
-    print(f"perimeter truss outer chord coverage: {coverage:.3f}")
-    failures = _check(outer_chord_length > 0.0, "perimeter truss has outer chord members")
 
     web_count = sum(
         1
@@ -297,11 +302,11 @@ def _check_continuous_perimeter_truss(case: Case, layout: dict[str, Any]) -> int
         len(corner_members) == 0,
         f"large brace has no separate corner members; actual={len(corner_members)}",
     )
-    max_gap = _max_edge_panel_length(layout)
-    print(f"perimeter truss maximum edge panel: {max_gap:.3f}")
+    max_gap = _max_edge_truss_station_gap(layout)
+    print(f"discrete edge-truss maximum panel station gap: {max_gap:.3f}")
     failures += _check(
         max_gap <= float(case.params["truss_panel_max"]) + 1e-6,
-        "perimeter edge panels do not exceed truss_panel_max",
+        "discrete edge-truss panels do not exceed truss_panel_max",
     )
     groups = {
         member["belongs_to_corner_bracket"]
@@ -316,8 +321,8 @@ def _check_continuous_perimeter_truss(case: Case, layout: dict[str, Any]) -> int
             if member.get("belongs_to_corner_bracket") == group
         }
         failures += _check(
-            {"edge_panel", "leg"} <= roles,
-            f"{group} groups adjacent edge panels and diagonal leg",
+            {"tier_1", "tier_2", "tier_3", "tier_3_perpendicular_web"} <= roles,
+            f"{group} contains the approved three tiers and recurrence webs",
         )
     failures += _check(not _has_diagonal_lacing(layout), "paired internal strut ties are perpendicular-only by default")
     return failures
@@ -445,53 +450,47 @@ def _check_corner_bracket_geometry_legacy(case: Case, layout: dict[str, Any]) ->
 
 
 def _check_corner_bracket_geometry(case: Case, layout: dict[str, Any]) -> int:
-    engine = StrutEngine(case.coords, case.params)
-    waling = Polygon(layout["waling"])
-    model = engine._large_brace_corner_anchor_model(layout, waling)
-    failures = _check(len(model["corners"]) == 4, "four corner truss assemblies exist")
-    members_by_id = {member["id"]: member for member in layout["members"]}
+    waling = LineString(layout["waling"])
+    logical = _logical_members(layout["members"])
+    groups = sorted({
+        str(member["belongs_to_corner_bracket"])
+        for member in logical
+        if member.get("belongs_to_corner_bracket")
+        and str(member.get("corner_role", "")).startswith("tier_")
+    })
+    failures = _check(len(groups) == 4, "four corner truss assemblies exist")
 
-    for index, corner in enumerate(model["corners"]):
-        group = corner["assembly_id"]
-        leg_members = [
-            member for member in layout["members"]
+    for index, group in enumerate(groups):
+        members = [
+            member for member in logical
             if member.get("belongs_to_corner_bracket") == group
-            and member.get("corner_role") == "leg"
         ]
-        edge_members = [
-            member for member in layout["members"]
-            if member.get("belongs_to_corner_bracket") == group
-            and member.get("corner_role") == "edge_panel"
-        ]
-        failures += _check(
-            sum(member["kind"] == "truss_chord" for member in leg_members) >= 2
-            and sum(member["kind"] == "truss_web" for member in leg_members) >= 1,
-            f"corner {index} has double-chord triangular lattice",
+        by_role: dict[str, list[dict[str, Any]]] = {}
+        for member in members:
+            by_role.setdefault(str(member.get("corner_role")), []).append(member)
+        topology_ok = (
+            len(by_role.get("tier_1", [])) == 1
+            and len(by_role.get("tier_2", [])) == 1
+            and len(by_role.get("tier_3", [])) == 1
+            and len(by_role.get("tier_3_perpendicular_web", [])) == 2
+            and all(member["kind"] == "truss_web" for member in members)
         )
-        failures += _check(bool(edge_members), f"corner {index} shares edge-panel handoffs")
+        failures += _check(topology_ok, f"corner {index} has three tiers and two recurrence webs")
+        if not topology_ok:
+            continue
 
-        anchors = (corner["prev_anchor"], corner["next_anchor"])
+        tier_two = by_role["tier_2"][0]
+        common = Point(tier_two["corner_inner_common"])
         failures += _check(
-            all(waling.exterior.distance(Point(anchor)) <= 1e-6 for anchor in anchors),
-            f"corner {index} anchors land on adjacent waling edges",
+            LineString(tier_two["geometry"]).distance(common) <= 1e-6,
+            f"corner {index} tier 2 passes the inner-chord common node",
         )
-        failures += _check(
-            all(Point(anchor).distance(Point(corner["corner"])) > 1e-6 for anchor in anchors),
-            f"corner {index} avoids true waling vertex",
-        )
-        for anchor_name, anchor in zip(("previous", "next"), anchors):
-            node = next((
-                node for node in layout["nodes"]
-                if Point(node["pos"]).distance(Point(anchor)) <= 1e-6
-            ), None)
-            roles = {
-                members_by_id[member_id].get("corner_role")
-                for member_id in (node or {}).get("source", [])
-                if member_id in members_by_id
-            }
+        for web in by_role["tier_3_perpendicular_web"]:
+            anchor = Point(web["previous_waling_anchor"])
             failures += _check(
-                node is not None and {"edge_panel", "leg"} <= roles,
-                f"corner {index} {anchor_name} handoff is one shared graph node",
+                LineString(web["geometry"]).distance(anchor) <= 1e-6
+                and waling.distance(anchor) <= 1e-6,
+                f"corner {index} recurrence web reaches the tier-2 waling anchor",
             )
 
     waling_line = LineString(layout["waling"])
@@ -561,7 +560,9 @@ def _check_pair_scoped_ties(case: Case, layout: dict[str, Any]) -> int:
     main_struts = _logical_members([
         member for member in layout["members"] if member["kind"] == "main_strut"
     ])
-    ties = [member for member in layout["members"] if member["kind"] == "tie"]
+    ties = _logical_members([
+        member for member in layout["members"] if member["kind"] == "tie"
+    ])
     scoped = True
     for tie in ties:
         tie_line = LineString(tie["geometry"])
@@ -613,7 +614,13 @@ def _check_grouped_coupling_ties(case: Case, layout: dict[str, Any]) -> int:
 
 
 def _check_required_pillars(case: Case, layout: dict[str, Any]) -> int:
-    required_points = _main_and_tie_intersection_points(layout)
+    excavation = Polygon(case.coords)
+    safe_dist = float(case.params["safe_dist"])
+    required_points = [
+        point for point in _main_and_tie_intersection_points(layout)
+        if excavation.covers(Point(point))
+        and excavation.exterior.distance(Point(point)) >= safe_dist - 1e-6
+    ]
     pillar_points = [Point(point) for point in layout["pillars"]]
     print(f"pillars: count={len(pillar_points)}, required_main_tie_or_main_cross={len(required_points)}")
     return _check(
@@ -927,6 +934,7 @@ def _internal_truss_members(layout: dict[str, Any]) -> list[dict[str, Any]]:
         member
         for member in layout["members"]
         if member["kind"] in {"truss_chord", "truss_web"}
+        and not member.get("corner_role")
         and waling_line.distance(LineString(member["geometry"]).interpolate(0.5, normalized=True)) > 5.0
     ]
 
@@ -1033,6 +1041,35 @@ def _max_edge_panel_length(layout: dict[str, Any]) -> float:
         and waling.distance(LineString(member["geometry"]).interpolate(0.5, normalized=True)) <= 1e-6
     ]
     return max(lengths, default=float("inf"))
+
+
+def _max_edge_truss_station_gap(layout: dict[str, Any]) -> float:
+    gaps: list[float] = []
+    logical = _logical_members(layout["members"])
+    for edge_index, (start, end) in enumerate(
+        zip(layout["waling"], layout["waling"][1:]),
+        start=1,
+    ):
+        edge = LineString([start, end])
+        positions = [0.0, edge.length]
+        for member in logical:
+            if (
+                member.get("edge_truss_id") == f"edge_truss_{edge_index}"
+                and member.get("edge_role") == "web"
+            ):
+                positions.extend(
+                    float(edge.project(Point(point)))
+                    for point in (member["geometry"][0], member["geometry"][-1])
+                )
+            if str(member.get("corner_role", "")).startswith("tier_"):
+                positions.extend(
+                    float(edge.project(Point(point)))
+                    for point in (member["geometry"][0], member["geometry"][-1])
+                    if edge.distance(Point(point)) <= 1e-6
+                )
+        unique = sorted({round(position, 6) for position in positions})
+        gaps.extend(right - left for left, right in zip(unique, unique[1:]))
+    return max(gaps, default=float("inf"))
 
 
 def _logical_members(members: list[dict[str, Any]]) -> list[dict[str, Any]]:

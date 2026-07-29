@@ -457,22 +457,16 @@ def validate_perimeter_truss_continuity(
         )]
 
     if _is_large_brace_layout(layout, params):
-        waling = LineString(layout["waling"])
-        edge_panels = [
-            ref.line.length
-            for ref in truss_refs
-            if ref.kind == "truss_chord"
-            and waling.distance(ref.line.interpolate(0.5, normalized=True)) <= 1e-6
-        ]
         panel_max = float(params.get("truss_panel_max", params.get("spacing_max", 9.0)))
-        if edge_panels and max(edge_panels) <= panel_max + 1e-6:
+        max_gap = _max_discrete_edge_truss_station_gap(layout)
+        if max_gap <= panel_max + 1e-6:
             return []
         return [ValidationIssue(
-            "truss_chord",
+            "truss_web",
             None,
             None,
             None,
-            "perimeter_edge_panel_exceeds_max",
+            f"edge_truss_panel_gap:{max_gap:.3f}",
             "warning",
         )]
 
@@ -491,6 +485,111 @@ def validate_perimeter_truss_continuity(
     return []
 
 
+def validate_edge_truss_corner_topology(
+    layout: dict[str, Any],
+    params: dict[str, Any] | None,
+) -> list[ValidationIssue]:
+    if not params or params.get("support_system") not in {"brace", "straight_truss"}:
+        return []
+    if not layout.get("waling"):
+        return []
+
+    tolerance = 1e-6
+    waling = LineString(layout["waling"])
+    logical: dict[str, dict[str, Any]] = {}
+    for member in layout.get("members", []):
+        logical_id = str(member.get("parent_member_id", member.get("id")))
+        if logical_id in logical:
+            continue
+        record = dict(member)
+        record["id"] = logical_id
+        record["geometry"] = member.get("logical_geometry", member.get("geometry", []))
+        logical[logical_id] = record
+
+    issues: list[ValidationIssue] = []
+    for member in logical.values():
+        geometry = member.get("geometry", [])
+        if len(geometry) < 2:
+            continue
+        line = LineString(geometry)
+        if (
+            member.get("kind") == "truss_chord"
+            and waling.buffer(tolerance).covers(line)
+        ):
+            issues.append(ValidationIssue(
+                "truss_chord",
+                str(member["id"]),
+                None,
+                None,
+                "edge_truss_outer_chord_duplicates_waling",
+            ))
+
+        role = str(member.get("corner_role", ""))
+        if role == "tier_2" and member.get("corner_inner_common") is not None:
+            common = Point(member["corner_inner_common"])
+            if line.distance(common) > tolerance:
+                issues.append(ValidationIssue(
+                    str(member.get("kind", "truss_web")),
+                    str(member["id"]),
+                    None,
+                    (float(common.x), float(common.y)),
+                    "corner_tier_2_misses_inner_common",
+                ))
+        if role.endswith("_perpendicular_web") and member.get("previous_waling_anchor") is not None:
+            anchor = Point(member["previous_waling_anchor"])
+            if line.distance(anchor) > tolerance or waling.distance(anchor) > tolerance:
+                issues.append(ValidationIssue(
+                    str(member.get("kind", "truss_web")),
+                    str(member["id"]),
+                    None,
+                    (float(anchor.x), float(anchor.y)),
+                    "corner_tier_web_misses_previous_waling_anchor",
+                ))
+
+    assemblies: dict[str, list[dict[str, Any]]] = {}
+    for member in logical.values():
+        assembly = member.get("belongs_to_corner_bracket")
+        if assembly is not None:
+            assemblies.setdefault(str(assembly), []).append(member)
+    for assembly, members in assemblies.items():
+        for index, left in enumerate(members):
+            left_geometry = left.get("geometry", [])
+            if len(left_geometry) < 2:
+                continue
+            left_line = LineString(left_geometry)
+            left_dx = left_line.coords[-1][0] - left_line.coords[0][0]
+            left_dy = left_line.coords[-1][1] - left_line.coords[0][1]
+            for right in members[index + 1:]:
+                right_geometry = right.get("geometry", [])
+                if len(right_geometry) < 2:
+                    continue
+                right_line = LineString(right_geometry)
+                if left_line.equals(right_line):
+                    issues.append(ValidationIssue(
+                        str(left.get("kind", "truss_web")),
+                        str(left["id"]),
+                        str(right["id"]),
+                        None,
+                        f"corner_member_clutter:duplicate:{assembly}",
+                    ))
+                    continue
+                right_dx = right_line.coords[-1][0] - right_line.coords[0][0]
+                right_dy = right_line.coords[-1][1] - right_line.coords[0][1]
+                scale = max(left_line.length * right_line.length, tolerance)
+                if abs(left_dx * right_dy - left_dy * right_dx) / scale > tolerance:
+                    continue
+                distance = left_line.distance(right_line)
+                if tolerance < distance < 3.0 - tolerance:
+                    issues.append(ValidationIssue(
+                        str(left.get("kind", "truss_web")),
+                        str(left["id"]),
+                        str(right["id"]),
+                        None,
+                        f"corner_member_clutter:close_parallel:{assembly}:{distance:.3f}",
+                    ))
+    return issues
+
+
 def validate_layout(layout: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
     issues = []
     issues.extend(validate_member_bounds(layout, params))
@@ -502,6 +601,7 @@ def validate_layout(layout: dict[str, Any], params: dict[str, Any] | None = None
     issues.extend(validate_core_protection(layout, params))
     issues.extend(validate_connection_spacing(layout, params))
     issues.extend(validate_perimeter_truss_continuity(layout, params))
+    issues.extend(validate_edge_truss_corner_topology(layout, params))
 
     issue_dicts = [asdict(issue) for issue in issues]
     return {
@@ -519,6 +619,46 @@ def validate_layout(layout: dict[str, Any], params: dict[str, Any] | None = None
         )},
         "stats": layout.get("stats", {}),
     }
+
+
+def _max_discrete_edge_truss_station_gap(layout: dict[str, Any]) -> float:
+    logical: dict[str, dict[str, Any]] = {}
+    for member in layout.get("members", []):
+        logical_id = str(member.get("parent_member_id", member.get("id")))
+        if logical_id in logical:
+            continue
+        record = dict(member)
+        record["geometry"] = member.get("logical_geometry", member.get("geometry", []))
+        logical[logical_id] = record
+
+    gaps: list[float] = []
+    for edge_index, (start, end) in enumerate(
+        zip(layout["waling"], layout["waling"][1:]),
+        start=1,
+    ):
+        edge = LineString([start, end])
+        positions = [0.0, edge.length]
+        for member in logical.values():
+            geometry = member.get("geometry", [])
+            if len(geometry) < 2:
+                continue
+            if (
+                member.get("edge_truss_id") == f"edge_truss_{edge_index}"
+                and member.get("edge_role") == "web"
+            ):
+                positions.extend(
+                    float(edge.project(Point(point)))
+                    for point in (geometry[0], geometry[-1])
+                )
+            if str(member.get("corner_role", "")).startswith("tier_"):
+                positions.extend(
+                    float(edge.project(Point(point)))
+                    for point in (geometry[0], geometry[-1])
+                    if edge.distance(Point(point)) <= 1e-6
+                )
+        unique = sorted({round(position, 6) for position in positions})
+        gaps.extend(right - left for left, right in zip(unique, unique[1:]))
+    return max(gaps, default=float("inf"))
 
 
 def _points_from_intersection(geom: Any) -> list[tuple[float, float]]:
