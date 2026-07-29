@@ -322,7 +322,7 @@ class StrutEngine:
     # ------------------------------------------------------------------
 
     def _place_waling(self, layout: dict[str, Any]) -> Polygon:
-        waling_poly = self._offset_poly(self.params["waling_offset"]) or self.poly
+        waling_poly = self._waling_poly()
         coords = _closed_coords(list(waling_poly.exterior.coords))
         layout["waling"] = coords
         self._add_member(
@@ -2903,6 +2903,18 @@ class StrutEngine:
     # ------------------------------------------------------------------
     # Low-level helpers
     # ------------------------------------------------------------------
+
+    def _waling_poly(self) -> Polygon:
+        offset = float(self.params["waling_offset"])
+        try:
+            result = self.poly.buffer(offset, join_style="mitre")
+        except Exception:
+            return self.poly
+        if isinstance(result, MultiPolygon):
+            result = max(result.geoms, key=lambda geom: geom.area)
+        if not isinstance(result, Polygon) or result.is_empty:
+            return self.poly
+        return result
 
     def _offset_poly(self, dist: float) -> Polygon | None:
         try:

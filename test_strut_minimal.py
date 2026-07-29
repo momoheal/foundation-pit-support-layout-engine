@@ -1398,6 +1398,18 @@ def test_edge_truss_uses_waling_as_outer_chord() -> None:
     assert outer_chord_length > 0.0
 
 
+def test_p0_waling_is_outside_excavation_edge_by_pile_radius() -> None:
+    case = next(case for case in CASES if case.name == "large_rect_120x80_brace")
+    layout = solve_case(case)
+    excavation = Polygon(case.coords)
+    waling = Polygon(layout["waling"])
+
+    assert waling.contains(excavation)
+    assert abs(
+        waling.exterior.distance(excavation.exterior) - case.params["waling_offset"]
+    ) <= 1e-6
+
+
 def test_main_strut_grid_uses_edge_anchored_modular_spacing() -> None:
     case = next(case for case in CASES if case.name == "large_rect_120x80_brace")
     layout = solve_case(case)
