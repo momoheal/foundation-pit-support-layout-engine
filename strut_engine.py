@@ -239,6 +239,7 @@ class StrutEngine:
         self._merge_nearby_nodes(layout)
         self._planarize_structural_members(layout)
         self._merge_nearby_nodes(layout)
+        self._place_pillars_from_nodes(layout, Polygon(layout["waling"]))
         self._attach_stats(layout)
         self._attach_validation(layout)
         return layout
@@ -266,7 +267,6 @@ class StrutEngine:
         struts = self._place_main_struts(layout, waling_poly, include_x=True, include_y=True)
         self._place_single_direction_ties(layout, struts, waling_poly)
         self._place_secondary_perimeter_supports(layout, waling_poly)
-        self._place_pillars_from_nodes(layout, waling_poly)
 
     def solve_brace(self, layout: dict[str, Any]) -> None:
         waling_poly = self._place_waling(layout)
@@ -286,7 +286,6 @@ class StrutEngine:
             self._place_corner_struts(layout, waling_poly)
         self._split_truss_members_at_main_crossings(layout)
         self._add_structural_cross_nodes(layout)
-        self._place_pillars_from_nodes(layout, waling_poly)
 
     def solve_opposite_strut(self, layout: dict[str, Any]) -> None:
         waling_poly = self._place_waling(layout)
@@ -295,7 +294,6 @@ class StrutEngine:
         self._place_opposite_strut_y_ties(layout, struts, waling_poly)
         self._split_truss_members_at_main_crossings(layout)
         self._add_structural_cross_nodes(layout)
-        self._place_pillars_from_nodes(layout, waling_poly)
 
     def solve_straight_truss(self, layout: dict[str, Any]) -> None:
         waling_poly = self._place_waling(layout)
@@ -316,12 +314,10 @@ class StrutEngine:
             pair_adjacent=True,
         )
         self._add_structural_cross_nodes(layout)
-        self._place_pillars_from_nodes(layout, waling_poly)
 
     def solve_circular(self, layout: dict[str, Any]) -> None:
         waling_poly = self._place_waling(layout)
         self._place_inner_ring_system(layout, waling_poly)
-        self._place_pillars_from_nodes(layout, waling_poly)
 
     def _recommend_system(self) -> str:
         """Return a hint only; this value never overrides ``support_system``."""

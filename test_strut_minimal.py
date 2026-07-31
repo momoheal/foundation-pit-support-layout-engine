@@ -1859,6 +1859,48 @@ def test_pillars_support_main_crosses_but_not_tie_only_nodes() -> None:
     )
 
 
+def test_every_pillar_is_a_final_non_collinear_logical_main_strut_crossing() -> None:
+    for case_name in ("straight_truss_rect", "large_rect_120x80_brace"):
+        case = next(case for case in CASES if case.name == case_name)
+        layout = solve_case(case)
+        logical_main_struts = [
+            member
+            for member in _logical_members(layout["members"])
+            if member["kind"] == "main_strut"
+        ]
+
+        assert layout["pillars"]
+        for pillar in layout["pillars"]:
+            point = Point(pillar)
+            assert any(
+                point.distance(Point(node["pos"])) <= 1e-6
+                for node in layout["nodes"]
+            )
+            covering = [
+                member
+                for member in logical_main_struts
+                if LineString(member["geometry"]).distance(point) <= 1e-6
+            ]
+            assert len(covering) >= 2
+            assert any(
+                LineString(left["geometry"]).intersection(
+                    LineString(right["geometry"]),
+                ).geom_type == "Point"
+                and LineString(left["geometry"]).intersection(
+                    LineString(right["geometry"]),
+                ).distance(point) <= 1e-6
+                for index, left in enumerate(covering)
+                for right in covering[index + 1:]
+            )
+
+        expected = _main_strut_crossing_points(layout)
+        assert expected
+        assert all(
+            any(Point(pillar).distance(Point(point)) <= 0.1 for pillar in layout["pillars"])
+            for point in expected
+        )
+
+
 def test_dxf_layers() -> None:
     TMP_ROOT.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=TMP_ROOT) as tmp:

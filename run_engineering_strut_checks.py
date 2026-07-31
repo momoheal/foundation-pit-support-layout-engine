@@ -170,6 +170,8 @@ def _print_summary_and_check(
     if case.params["support_system"] == "opposite_strut":
         failures += _check_opposite_strut(case, layout)
         failures += _check_grouped_coupling_ties(case, layout)
+
+    if case.params["support_system"] != "circular":
         failures += _check_required_pillars(case, layout)
 
     if case.params["support_system"] == "straight_truss":
@@ -706,10 +708,41 @@ def _check_required_pillars(case: Case, layout: dict[str, Any]) -> int:
         and excavation.exterior.distance(Point(node["pos"])) >= safe_dist - 1e-6
     ]
     pillar_points = [Point(point) for point in layout["pillars"]]
+    logical_main_struts = [
+        member
+        for member in _logical_members(layout["members"])
+        if member["kind"] == "main_strut"
+    ]
+    stale_pillars = [
+        pillar
+        for pillar in pillar_points
+        if not any(pillar.distance(Point(node["pos"])) <= 1e-6 for node in layout["nodes"])
+    ]
+    invalid_main_cross_pillars = []
+    if case.params["support_system"] != "circular":
+        for pillar in pillar_points:
+            covering = [
+                member
+                for member in logical_main_struts
+                if LineString(member["geometry"]).distance(pillar) <= 1e-6
+            ]
+            if not any(
+                LineString(left["geometry"]).intersection(
+                    LineString(right["geometry"]),
+                ).geom_type == "Point"
+                and LineString(left["geometry"]).intersection(
+                    LineString(right["geometry"]),
+                ).distance(pillar) <= 1e-6
+                for index, left in enumerate(covering)
+                for right in covering[index + 1:]
+            ):
+                invalid_main_cross_pillars.append(pillar)
     print(
         f"pillars: count={len(pillar_points)}, "
         f"required_main_cross={len(required_points)}, "
-        f"prohibited_tie_only={len(prohibited_points)}"
+        f"prohibited_tie_only={len(prohibited_points)}, "
+        f"stale={len(stale_pillars)}, "
+        f"invalid_main_cross={len(invalid_main_cross_pillars)}"
     )
     failures = _check(
         all(any(Point(point).distance(pillar) <= 0.1 for pillar in pillar_points) for point in required_points),
@@ -718,6 +751,14 @@ def _check_required_pillars(case: Case, layout: dict[str, Any]) -> int:
     failures += _check(
         all(all(Point(point).distance(pillar) > 0.1 for pillar in pillar_points) for point in prohibited_points),
         "tie-only nodes do not have pillars",
+    )
+    failures += _check(
+        not stale_pillars,
+        "every pillar coincides with a node in the final topology",
+    )
+    failures += _check(
+        not invalid_main_cross_pillars,
+        "every non-circular pillar is a non-collinear logical main-strut crossing",
     )
     return failures
 
