@@ -877,6 +877,44 @@ def test_edge_truss_panel_lengths_are_mirrored_and_compact() -> None:
             assert max(sequence) <= case.params.get("truss_panel_max", 9.0) + 1e-6
 
 
+def test_edge_truss_v_apex_angles_do_not_exceed_100_degrees() -> None:
+    for case_name in ("straight_truss_rect", "large_rect_120x80_brace"):
+        case = next(case for case in CASES if case.name == case_name)
+        layout = solve_case(case)
+        angles = _edge_truss_v_apex_angles(layout)
+
+        assert angles, case_name
+        assert max(angles) <= 100.0 + 1e-6, (case_name, max(angles))
+
+
+def test_pair_coupling_ties_avoid_perpendicular_strut_pair_envelopes() -> None:
+    for case_name in ("straight_truss_rect", "large_rect_120x80_brace"):
+        case = next(case for case in CASES if case.name == case_name)
+        layout = solve_case(case)
+        dense_zone_ties = _ties_inside_perpendicular_pair_envelopes(layout)
+
+        assert dense_zone_ties == [], (case_name, dense_zone_ties)
+
+
+def test_tie_only_intersections_do_not_receive_pillars() -> None:
+    for case_name in ("straight_truss_rect", "large_rect_120x80_brace"):
+        case = next(case for case in CASES if case.name == case_name)
+        layout = solve_case(case)
+        tie_only_points = _tie_only_main_intersection_points(layout)
+        main_crosses = _main_strut_crossing_points(layout)
+
+        assert tie_only_points, case_name
+        assert all(
+            all(Point(pillar).distance(Point(point)) > 0.1 for pillar in layout["pillars"])
+            for point in tie_only_points
+        ), case_name
+        assert main_crosses, case_name
+        assert all(
+            any(Point(pillar).distance(Point(point)) <= 0.1 for pillar in layout["pillars"])
+            for point in main_crosses
+        ), case_name
+
+
 def test_large_brace_horizontal_main_group_uses_perpendicular_couplings() -> None:
     case = next(case for case in CASES if case.name == "large_rect_120x80_brace")
     layout = solve_case(case)
@@ -1020,8 +1058,8 @@ def test_large_brace_internal_tie_spacing_is_modular() -> None:
     limit = case.params.get("max_unbraced_pair_length", case.params["truss_panel_max"] * 1.5)
 
     for x_low, x_high in _paired_main_strut_axis_groups(layout, axis="x"):
-        rung_y = _short_tie_positions_between_pair(layout, x_low, x_high, vertical_pair=True)
-        assert _max_gap(rung_y) <= limit + 1e-6
+        positions = _pair_lateral_support_positions(layout, x_low, x_high, vertical_pair=True)
+        assert _max_gap(positions) <= limit + 1e-6
 
     for y_low, y_high in _paired_main_strut_axis_groups(layout, axis="y"):
         positions = _pair_lateral_support_positions(layout, y_low, y_high, vertical_pair=False)
@@ -1794,12 +1832,17 @@ def test_large_brace_perimeter_truss_wraps_all_four_edges() -> None:
     assert _large_brace_outer_edge_chords(layout) == []
 
 
-def test_pillars_are_sparse_and_not_every_truss_node() -> None:
+def test_pillars_support_main_crosses_but_not_tie_only_nodes() -> None:
     case = next(case for case in CASES if case.name == "large_rect_120x80_opposite_strut")
     layout = solve_case(case)
     excavation = Polygon(case.coords)
     required = [
-        point for point in _main_and_tie_intersection_points(layout)
+        point for point in _main_strut_crossing_points(layout)
+        if excavation.covers(Point(point))
+        and excavation.exterior.distance(Point(point)) >= case.params["safe_dist"] - 1e-6
+    ]
+    prohibited = [
+        point for point in _tie_only_main_intersection_points(layout)
         if excavation.covers(Point(point))
         and excavation.exterior.distance(Point(point)) >= case.params["safe_dist"] - 1e-6
     ]
@@ -1808,6 +1851,11 @@ def test_pillars_are_sparse_and_not_every_truss_node() -> None:
     assert all(
         any(Point(pillar).distance(Point(point)) <= 0.1 for pillar in layout["pillars"])
         for point in required
+    )
+    assert prohibited
+    assert all(
+        all(Point(pillar).distance(Point(point)) > 0.1 for pillar in layout["pillars"])
+        for point in prohibited
     )
 
 
@@ -2000,6 +2048,102 @@ def _edge_truss_projected_panel_lengths(
         panels.append((positions[0], positions[-1]))
     panels.sort()
     return [round(end_pos - start_pos, 6) for start_pos, end_pos in panels]
+
+
+def _edge_truss_v_apex_angles(layout: dict[str, Any]) -> list[float]:
+    webs = [
+        member
+        for member in _logical_members(layout["members"])
+        if member.get("edge_role") == "web"
+    ]
+    angles: list[float] = []
+    for index, left in enumerate(webs):
+        for right in webs[index + 1:]:
+            if left.get("edge_truss_id") != right.get("edge_truss_id"):
+                continue
+            shared = next((
+                left_point
+                for left_point in (left["geometry"][0], left["geometry"][-1])
+                for right_point in (right["geometry"][0], right["geometry"][-1])
+                if Point(left_point).distance(Point(right_point)) <= 1e-6
+            ), None)
+            if shared is None or LineString(layout["waling"]).distance(Point(shared)) <= 1e-6:
+                continue
+            ends = [
+                member["geometry"][-1]
+                if Point(member["geometry"][0]).distance(Point(shared)) <= 1e-6
+                else member["geometry"][0]
+                for member in (left, right)
+            ]
+            vectors = [
+                (point[0] - shared[0], point[1] - shared[1])
+                for point in ends
+            ]
+            cross = abs(vectors[0][0] * vectors[1][1] - vectors[0][1] * vectors[1][0])
+            dot = vectors[0][0] * vectors[1][0] + vectors[0][1] * vectors[1][1]
+            angles.append(degrees(atan2(cross, dot)))
+    return angles
+
+
+def _ties_inside_perpendicular_pair_envelopes(
+    layout: dict[str, Any],
+) -> list[dict[str, Any]]:
+    logical = _logical_members(layout["members"])
+    main = [member for member in logical if member["kind"] == "main_strut"]
+    vertical_axes = sorted({round(member["geometry"][0][0], 6) for member in main if _is_vertical(member)})
+    horizontal_axes = sorted({round(member["geometry"][0][1], 6) for member in main if _is_horizontal(member)})
+    vertical_pairs = list(zip(vertical_axes[::2], vertical_axes[1::2]))
+    horizontal_pairs = list(zip(horizontal_axes[::2], horizontal_axes[1::2]))
+    return [
+        member
+        for member in logical
+        if member["kind"] == "tie"
+        and (
+            _is_horizontal(member)
+            and any(low < member["geometry"][0][1] < high for low, high in horizontal_pairs)
+            or _is_vertical(member)
+            and any(low < member["geometry"][0][0] < high for low, high in vertical_pairs)
+        )
+    ]
+
+
+def _tie_only_main_intersection_points(layout: dict[str, Any]) -> list[tuple[float, float]]:
+    logical = _logical_members(layout["members"])
+    main = [member for member in logical if member["kind"] == "main_strut"]
+    ties = [member for member in logical if member["kind"] == "tie"]
+    points: list[tuple[float, float]] = []
+    for tie in ties:
+        for endpoint in (tie["geometry"][0], tie["geometry"][-1]):
+            if sum(
+                LineString(member["geometry"]).distance(Point(endpoint)) <= 1e-6
+                for member in main
+            ) == 1:
+                points.append((float(endpoint[0]), float(endpoint[1])))
+    return _dedup_points_for_test(points)
+
+
+def _main_strut_crossing_points(layout: dict[str, Any]) -> list[tuple[float, float]]:
+    main = [
+        member
+        for member in _logical_members(layout["members"])
+        if member["kind"] == "main_strut"
+    ]
+    points = [
+        (float(intersection.x), float(intersection.y))
+        for index, left in enumerate(main)
+        for right in main[index + 1:]
+        for intersection in [LineString(left["geometry"]).intersection(LineString(right["geometry"]))]
+        if intersection.geom_type == "Point"
+    ]
+    return _dedup_points_for_test(points)
+
+
+def _dedup_points_for_test(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    unique: list[tuple[float, float]] = []
+    for point in points:
+        if not any(Point(point).distance(Point(existing)) <= 1e-6 for existing in unique):
+            unique.append(point)
+    return unique
 
 
 def _large_brace_outer_edge_chords(layout: dict[str, Any]) -> list[dict[str, Any]]:

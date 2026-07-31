@@ -8,7 +8,7 @@ meaning from the old bucket names.
 
 from __future__ import annotations
 
-from math import atan2, ceil, cos, degrees, pi, sin
+from math import atan2, ceil, cos, degrees, pi, sin, tan
 from typing import Any
 
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
@@ -20,6 +20,7 @@ Point2D = tuple[float, float]
 Geometry = list[Point2D]
 
 SUPPORT_SYSTEMS = {"orthogonal", "brace", "opposite_strut", "straight_truss", "circular"}
+EDGE_TRUSS_MAX_APEX_ANGLE = 100.0
 STATS_KEYS = (
     "main_strut_length",
     "corner_length",
@@ -515,7 +516,6 @@ class StrutEngine:
         if len(corners) < 3:
             return {"corners": [], "inner_lines": []}
         centroid = (float(waling_poly.centroid.x), float(waling_poly.centroid.y))
-        panel_max = float(self.params["truss_panel_max"])
         configured_spacing = self.params.get("corner_truss_tier_spacing")
         depth = (
             float(configured_spacing)
@@ -526,6 +526,7 @@ class StrutEngine:
                 float(self.params["min_tie_to_strut_clearance"]) * (2.0 ** 0.5),
             )
         )
+        panel_max = self._edge_truss_panel_limit(depth)
         requested_tiers = int(self.params["corner_truss_tier_count"])
         inner_lines: list[Geometry] = []
 
@@ -1014,7 +1015,10 @@ class StrutEngine:
             if self._uses_large_corner_truss(waling_poly) and not extra_anchor_points:
                 outer_nodes = self._stabilize_corner_adjacent_edge_nodes(outer_nodes, start, end, edge_depth)
             outer_nodes = self._force_even_edge_panel_count(outer_nodes)
-            outer_nodes = self._subdivide_edge_truss_panels(outer_nodes, float(self.params["truss_panel_max"]))
+            outer_nodes = self._subdivide_edge_truss_panels(
+                outer_nodes,
+                self._edge_truss_panel_limit(edge_depth),
+            )
             if len(outer_nodes) < 2:
                 continue
             edge_nodes.append(outer_nodes)
@@ -1197,6 +1201,10 @@ class StrutEngine:
                 for index in range(1, steps + 1)
             ])
         return subdivided
+
+    def _edge_truss_panel_limit(self, depth: float) -> float:
+        angle_limit = depth * tan(EDGE_TRUSS_MAX_APEX_ANGLE * pi / 360.0)
+        return min(float(self.params["truss_panel_max"]), angle_limit)
 
     def _orient_edge_truss_nodes(
         self,
@@ -1786,6 +1794,11 @@ class StrutEngine:
             if pair_adjacent
             else self._paired_group_struts(by_axis["x"], axis="x")
         )
+        horizontal_pairs = (
+            self._adjacent_strut_pairs(by_axis["y"])
+            if pair_adjacent
+            else self._paired_group_struts(by_axis["y"], axis="y")
+        )
         for left, right in vertical_pairs:
             left_geom = left["member"]["geometry"]
             right_geom = right["member"]["geometry"]
@@ -1800,6 +1813,8 @@ class StrutEngine:
                 avoid=self._existing_long_tie_axes(layout, vertical_pair=True),
             )
             for y in y_positions:
+                if self._axis_inside_strut_pair_envelopes(y, horizontal_pairs, axis="y"):
+                    continue
                 y_tie = [(left_geom[0][0], y), (right_geom[0][0], y)]
                 line = LineString(y_tie)
                 if not waling_poly.buffer(1e-6).covers(line):
@@ -1821,11 +1836,6 @@ class StrutEngine:
                     node_kind="truss_node",
                 )
 
-        horizontal_pairs = (
-            self._adjacent_strut_pairs(by_axis["y"])
-            if pair_adjacent
-            else self._paired_group_struts(by_axis["y"], axis="y")
-        )
         for bottom, top in horizontal_pairs:
             bottom_geom = bottom["member"]["geometry"]
             top_geom = top["member"]["geometry"]
@@ -1840,6 +1850,8 @@ class StrutEngine:
                 avoid=self._perpendicular_main_axes(layout, vertical_pair=False),
             )
             for x in x_positions:
+                if self._axis_inside_strut_pair_envelopes(x, vertical_pairs, axis="x"):
+                    continue
                 y_bottom = bottom_geom[0][1]
                 y_top = top_geom[0][1]
                 candidate = [(x, y_bottom), (x, y_top)]
@@ -2130,6 +2142,27 @@ class StrutEngine:
             for index in range(0, len(struts) - 1, 2)
         ]
 
+    def _axis_inside_strut_pair_envelopes(
+        self,
+        value: float,
+        pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+        *,
+        axis: str,
+    ) -> bool:
+        index = 0 if axis == "x" else 1
+        return any(
+            min(
+                _member_midpoint(first["member"])[index],
+                _member_midpoint(second["member"])[index],
+            ) - 1e-6
+            <= value
+            <= max(
+                _member_midpoint(first["member"])[index],
+                _member_midpoint(second["member"])[index],
+            ) + 1e-6
+            for first, second in pairs
+        )
+
     def _coupling_positions(self, lo: float, hi: float) -> list[float]:
         span = hi - lo
         if span <= self.params["spacing_min"]:
@@ -2254,7 +2287,7 @@ class StrutEngine:
                         continue
                     kinds = {left["kind"], right["kind"]}
                     if kinds == {"main_strut", "tie"}:
-                        node_kind = "strut_cross|tie_end"
+                        node_kind = "tie_end"
                     elif kinds == {"main_strut"}:
                         node_kind = "strut_cross"
                     elif kinds == {"tie"}:
@@ -3351,10 +3384,6 @@ def _pillar_candidate_score(kind: str) -> int:
         return 100
     if "ring_radial" in kind:
         return 80
-    if "tie_end" in kind:
-        return 60
-    if "truss_node" in kind and "tie" in kind:
-        return 50
     return 0
 
 

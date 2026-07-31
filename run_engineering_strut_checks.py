@@ -317,9 +317,14 @@ def _check_edge_panel_symmetry(case: Case, layout: dict[str, Any]) -> int:
         max(sequence, default=float("inf")) <= float(case.params["truss_panel_max"]) + 1e-6
         for sequence in sequences
     )
+    apex_angles = _edge_truss_v_apex_angles(layout)
     failures = _check(opposite_edges_match, "opposite edge-truss panel sequences match")
     failures += _check(mirrored, "each edge-truss panel sequence mirrors about its midpoint")
     failures += _check(within_limit, "edge-truss panels remain within truss_panel_max")
+    failures += _check(
+        bool(apex_angles) and max(apex_angles) <= 100.0 + 1e-6,
+        f"edge-truss V apex angle <= 100 degrees; actual={max(apex_angles, default=float('inf')):.3f}",
+    )
     return failures
 
 
@@ -613,6 +618,11 @@ def _check_pair_scoped_ties(case: Case, layout: dict[str, Any]) -> int:
     )
     failures = _check(bool(ties) and scoped, f"ties are independent pair-scoped members; actual={len(ties)}")
     failures += _check(clear, f"ties keep {clearance:.3f} clearance from parallel main struts")
+    dense_zone_ties = _ties_inside_perpendicular_pair_envelopes(layout)
+    failures += _check(
+        dense_zone_ties == [],
+        f"perpendicular paired-strut envelopes contain no redundant ties; actual={len(dense_zone_ties)}",
+    )
     return failures
 
 
@@ -681,16 +691,35 @@ def _check_required_pillars(case: Case, layout: dict[str, Any]) -> int:
     excavation = Polygon(case.coords)
     safe_dist = float(case.params["safe_dist"])
     required_points = [
-        point for point in _main_and_tie_intersection_points(layout)
-        if excavation.covers(Point(point))
-        and excavation.exterior.distance(Point(point)) >= safe_dist - 1e-6
+        tuple(node["pos"])
+        for node in layout["nodes"]
+        if "strut_cross" in node["kind"]
+        and excavation.covers(Point(node["pos"]))
+        and excavation.exterior.distance(Point(node["pos"])) >= safe_dist - 1e-6
+    ]
+    prohibited_points = [
+        tuple(node["pos"])
+        for node in layout["nodes"]
+        if "tie_end" in node["kind"]
+        and "strut_cross" not in node["kind"]
+        and excavation.covers(Point(node["pos"]))
+        and excavation.exterior.distance(Point(node["pos"])) >= safe_dist - 1e-6
     ]
     pillar_points = [Point(point) for point in layout["pillars"]]
-    print(f"pillars: count={len(pillar_points)}, required_main_tie_or_main_cross={len(required_points)}")
-    return _check(
-        all(any(Point(point).distance(pillar) <= 0.1 for pillar in pillar_points) for point in required_points),
-        "all main-strut/tie and main-strut cross nodes have pillars",
+    print(
+        f"pillars: count={len(pillar_points)}, "
+        f"required_main_cross={len(required_points)}, "
+        f"prohibited_tie_only={len(prohibited_points)}"
     )
+    failures = _check(
+        all(any(Point(point).distance(pillar) <= 0.1 for pillar in pillar_points) for point in required_points),
+        "all main-strut cross nodes have pillars",
+    )
+    failures += _check(
+        all(all(Point(point).distance(pillar) > 0.1 for pillar in pillar_points) for point in prohibited_points),
+        "tie-only nodes do not have pillars",
+    )
+    return failures
 
 
 def _edge_has_main_group_centers(layout: dict[str, Any], edge_value: float, *, axis: str) -> bool:
@@ -1157,6 +1186,58 @@ def _edge_truss_projected_panel_lengths(
         panels.append((positions[0], positions[-1]))
     panels.sort()
     return [round(end_pos - start_pos, 6) for start_pos, end_pos in panels]
+
+
+def _edge_truss_v_apex_angles(layout: dict[str, Any]) -> list[float]:
+    webs = [
+        member
+        for member in _logical_members(layout["members"])
+        if member.get("edge_role") == "web"
+    ]
+    angles: list[float] = []
+    for index, left in enumerate(webs):
+        for right in webs[index + 1:]:
+            if left.get("edge_truss_id") != right.get("edge_truss_id"):
+                continue
+            shared = next((
+                left_point
+                for left_point in (left["geometry"][0], left["geometry"][-1])
+                for right_point in (right["geometry"][0], right["geometry"][-1])
+                if Point(left_point).distance(Point(right_point)) <= 1e-6
+            ), None)
+            if shared is None or LineString(layout["waling"]).distance(Point(shared)) <= 1e-6:
+                continue
+            ends = [
+                member["geometry"][-1]
+                if Point(member["geometry"][0]).distance(Point(shared)) <= 1e-6
+                else member["geometry"][0]
+                for member in (left, right)
+            ]
+            vectors = [(point[0] - shared[0], point[1] - shared[1]) for point in ends]
+            cross = abs(vectors[0][0] * vectors[1][1] - vectors[0][1] * vectors[1][0])
+            dot = vectors[0][0] * vectors[1][0] + vectors[0][1] * vectors[1][1]
+            angles.append(degrees(atan2(cross, dot)))
+    return angles
+
+
+def _ties_inside_perpendicular_pair_envelopes(layout: dict[str, Any]) -> list[dict[str, Any]]:
+    logical = _logical_members(layout["members"])
+    main = [member for member in logical if member["kind"] == "main_strut"]
+    vertical_axes = sorted({round(member["geometry"][0][0], 6) for member in main if _is_vertical(member)})
+    horizontal_axes = sorted({round(member["geometry"][0][1], 6) for member in main if _is_horizontal(member)})
+    vertical_pairs = list(zip(vertical_axes[::2], vertical_axes[1::2]))
+    horizontal_pairs = list(zip(horizontal_axes[::2], horizontal_axes[1::2]))
+    return [
+        member
+        for member in logical
+        if member["kind"] == "tie"
+        and (
+            _is_horizontal(member)
+            and any(low < member["geometry"][0][1] < high for low, high in horizontal_pairs)
+            or _is_vertical(member)
+            and any(low < member["geometry"][0][0] < high for low, high in vertical_pairs)
+        )
+    ]
 
 
 def _logical_members(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
