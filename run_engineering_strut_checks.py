@@ -165,6 +165,7 @@ def _print_summary_and_check(
         failures += _check_corner_bracket_geometry(case, layout)
         failures += _check_main_truss_crossing_vertices(layout)
         failures += _check_pair_scoped_ties(case, layout)
+        failures += _check_edge_panel_symmetry(case, layout)
 
     if case.params["support_system"] == "opposite_strut":
         failures += _check_opposite_strut(case, layout)
@@ -173,6 +174,7 @@ def _print_summary_and_check(
 
     if case.params["support_system"] == "straight_truss":
         failures += _check_straight_truss(case, layout)
+        failures += _check_straight_truss_pair_groups(layout)
 
     if case.name.startswith("large_brace"):
         failures += _check_edge_truss(case, layout)
@@ -293,6 +295,31 @@ def _check_edge_truss(case: Case, layout: dict[str, Any]) -> int:
     failures += _check(len(horizontal_groups) == 1, f"one horizontal double opposite strut group exists; actual={len(horizontal_groups)}")
     failures += _check(_minimum_group_spacing(vertical_groups) >= 10.0, "vertical double strut groups keep 10m spacing")
     failures += _check(_important_node_spacing(layout) >= 6.0, "important structural nodes keep 6m spacing")
+    return failures
+
+
+def _check_edge_panel_symmetry(case: Case, layout: dict[str, Any]) -> int:
+    sequences = [
+        _edge_truss_projected_panel_lengths(layout, edge_index)
+        for edge_index in range(1, 5)
+    ]
+    opposite_edges_match = all(
+        len(left) == len(right)
+        and all(abs(a - b) <= 2e-6 for a, b in zip(left, right))
+        for left, right in ((sequences[0], sequences[2]), (sequences[1], sequences[3]))
+    )
+    mirrored = all(
+        sequence
+        and all(abs(left - right) <= 2e-6 for left, right in zip(sequence, reversed(sequence)))
+        for sequence in sequences
+    )
+    within_limit = all(
+        max(sequence, default=float("inf")) <= float(case.params["truss_panel_max"]) + 1e-6
+        for sequence in sequences
+    )
+    failures = _check(opposite_edges_match, "opposite edge-truss panel sequences match")
+    failures += _check(mirrored, "each edge-truss panel sequence mirrors about its midpoint")
+    failures += _check(within_limit, "edge-truss panels remain within truss_panel_max")
     return failures
 
 
@@ -587,6 +614,43 @@ def _check_pair_scoped_ties(case: Case, layout: dict[str, Any]) -> int:
     failures = _check(bool(ties) and scoped, f"ties are independent pair-scoped members; actual={len(ties)}")
     failures += _check(clear, f"ties keep {clearance:.3f} clearance from parallel main struts")
     return failures
+
+
+def _check_straight_truss_pair_groups(layout: dict[str, Any]) -> int:
+    main_struts = _logical_members([
+        member for member in layout["members"] if member["kind"] == "main_strut"
+    ])
+    valid = True
+    details: list[tuple[str, set[tuple[float, float]], set[tuple[float, float]]]] = []
+    for orientation, tie_orientation, coordinate_index in (
+        ("vertical", "horizontal", 0),
+        ("horizontal", "vertical", 1),
+    ):
+        axes = sorted({
+            round(member["geometry"][0][coordinate_index], 6)
+            for member in main_struts
+            if (_is_vertical(member) if orientation == "vertical" else _is_horizontal(member))
+        })
+        expected = {
+            (axes[index], axes[index + 1])
+            for index in range(0, len(axes) - 1, 2)
+        }
+        actual = {
+            tuple(sorted((
+                round(member["geometry"][0][coordinate_index], 6),
+                round(member["geometry"][-1][coordinate_index], 6),
+            )))
+            for member in layout["members"]
+            if member["kind"] == "tie"
+            and (
+                _is_horizontal(member)
+                if tie_orientation == "horizontal"
+                else _is_vertical(member)
+            )
+        }
+        valid = valid and bool(expected) and actual == expected
+        details.append((orientation, expected, actual))
+    return _check(valid, f"straight-truss ties use non-overlapping main-strut pairs; {details}")
 
 
 def _check_grouped_coupling_ties(case: Case, layout: dict[str, Any]) -> int:
@@ -1070,6 +1134,29 @@ def _max_edge_truss_station_gap(layout: dict[str, Any]) -> float:
         unique = sorted({round(position, 6) for position in positions})
         gaps.extend(right - left for left, right in zip(unique, unique[1:]))
     return max(gaps, default=float("inf"))
+
+
+def _edge_truss_projected_panel_lengths(
+    layout: dict[str, Any],
+    edge_index: int,
+) -> list[float]:
+    start = layout["waling"][edge_index - 1]
+    end = layout["waling"][edge_index]
+    edge = LineString([start, end])
+    panels: list[tuple[float, float]] = []
+    for member in _logical_members(layout["members"]):
+        if (
+            member.get("edge_truss_id") != f"edge_truss_{edge_index}"
+            or member.get("edge_role") != "web"
+        ):
+            continue
+        positions = sorted(
+            float(edge.project(Point(point)))
+            for point in (member["geometry"][0], member["geometry"][-1])
+        )
+        panels.append((positions[0], positions[-1]))
+    panels.sort()
+    return [round(end_pos - start_pos, 6) for start_pos, end_pos in panels]
 
 
 def _logical_members(members: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -308,8 +308,12 @@ class StrutEngine:
         self._place_modular_corner_assemblies(layout, waling_poly, corner_model)
         self._place_perimeter_truss_stiffening(layout, waling_poly)
         self._place_straight_truss(layout, struts, waling_poly)
-        self._place_single_direction_ties(layout, struts, waling_poly)
-        self._place_opposite_strut_y_ties(layout, struts, waling_poly)
+        self._place_truss_coupling_ties(
+            layout,
+            struts,
+            waling_poly,
+            pair_adjacent=True,
+        )
         self._add_structural_cross_nodes(layout)
         self._place_pillars_from_nodes(layout, waling_poly)
 
@@ -595,24 +599,15 @@ class StrutEngine:
                         distance = edge.project(Point(point))
                         if corner_reach < distance < edge.length - corner_reach:
                             stations.append(distance)
-            outer_nodes: list[Point2D] = []
             unique_stations = sorted({round(float(value), 6) for value in stations})
-            for left, right in zip(unique_stations, unique_stations[1:]):
-                count = max(1, int(ceil((right - left) / panel_max)))
-                for step in range(count):
-                    distance = left + (right - left) * step / count
-                    point = edge.interpolate(distance)
-                    candidate = (round(float(point.x), 6), round(float(point.y), 6))
-                    if not outer_nodes or not _points_close(outer_nodes[-1], candidate):
-                        outer_nodes.append(candidate)
-            end_point = edge.interpolate(edge.length - corner_reach)
-            outer_nodes.append((round(float(end_point.x), 6), round(float(end_point.y), 6)))
-            outer_nodes = self._align_edge_main_anchor_parity(
-                layout,
-                outer_nodes,
-                outer_start,
-                outer_end,
-            )
+            fixed_nodes = [
+                (
+                    round(float(edge.interpolate(distance).x), 6),
+                    round(float(edge.interpolate(distance).y), 6),
+                )
+                for distance in unique_stations
+            ]
+            outer_nodes = self._subdivide_edge_truss_panels(fixed_nodes, panel_max)
             inner_nodes = [_offset_point(point, inward, depth) for point in outer_nodes]
             for panel_index, (outer_a, outer_b, inner_a, inner_b) in enumerate(zip(
                 outer_nodes,
@@ -1020,7 +1015,6 @@ class StrutEngine:
                 outer_nodes = self._stabilize_corner_adjacent_edge_nodes(outer_nodes, start, end, edge_depth)
             outer_nodes = self._force_even_edge_panel_count(outer_nodes)
             outer_nodes = self._subdivide_edge_truss_panels(outer_nodes, float(self.params["truss_panel_max"]))
-            outer_nodes = self._align_edge_main_anchor_parity(layout, outer_nodes, start, end)
             if len(outer_nodes) < 2:
                 continue
             edge_nodes.append(outer_nodes)
@@ -1193,6 +1187,8 @@ class StrutEngine:
         for start, end in zip(nodes, nodes[1:]):
             line = LineString([start, end])
             steps = max(1, int(ceil(line.length / max(max_panel, 1e-6))))
+            if steps % 2 != 0:
+                steps += 1
             subdivided.extend([
                 (
                     round(start[0] + (end[0] - start[0]) * index / steps, 6),
@@ -1201,43 +1197,6 @@ class StrutEngine:
                 for index in range(1, steps + 1)
             ])
         return subdivided
-
-    def _align_edge_main_anchor_parity(
-        self,
-        layout: dict[str, Any],
-        nodes: list[Point2D],
-        start: Point2D,
-        end: Point2D,
-    ) -> list[Point2D]:
-        edge = LineString([start, end])
-        main_points = [
-            endpoint
-            for member in layout["members"]
-            if member["kind"] == "main_strut"
-            for endpoint in (member["geometry"][0], member["geometry"][-1])
-            if edge.distance(Point(endpoint)) <= 1e-6
-        ]
-        if not main_points:
-            return nodes
-
-        adjusted = list(nodes)
-        target_parity = 0
-        index = 0
-        while index < len(adjusted):
-            point = adjusted[index]
-            if not any(_points_close(point, main_point, tol=1e-6) for main_point in main_points):
-                index += 1
-                continue
-            if index % 2 != target_parity and index > 0:
-                previous = adjusted[index - 1]
-                midpoint = (
-                    round((previous[0] + point[0]) / 2.0, 6),
-                    round((previous[1] + point[1]) / 2.0, 6),
-                )
-                adjusted.insert(index, midpoint)
-                index += 1
-            index += 1
-        return adjusted
 
     def _orient_edge_truss_nodes(
         self,
@@ -1808,6 +1767,8 @@ class StrutEngine:
         layout: dict[str, Any],
         struts: list[dict[str, Any]],
         waling_poly: Polygon,
+        *,
+        pair_adjacent: bool = False,
     ) -> None:
         by_axis = {
             "x": sorted(
@@ -1820,7 +1781,11 @@ class StrutEngine:
             ),
         }
 
-        vertical_pairs = self._paired_group_struts(by_axis["x"], axis="x")
+        vertical_pairs = (
+            self._adjacent_strut_pairs(by_axis["x"])
+            if pair_adjacent
+            else self._paired_group_struts(by_axis["x"], axis="x")
+        )
         for left, right in vertical_pairs:
             left_geom = left["member"]["geometry"]
             right_geom = right["member"]["geometry"]
@@ -1856,7 +1821,12 @@ class StrutEngine:
                     node_kind="truss_node",
                 )
 
-        for bottom, top in self._paired_group_struts(by_axis["y"], axis="y"):
+        horizontal_pairs = (
+            self._adjacent_strut_pairs(by_axis["y"])
+            if pair_adjacent
+            else self._paired_group_struts(by_axis["y"], axis="y")
+        )
+        for bottom, top in horizontal_pairs:
             bottom_geom = bottom["member"]["geometry"]
             top_geom = top["member"]["geometry"]
             x_min = max(min(bottom_geom[0][0], bottom_geom[-1][0]), min(top_geom[0][0], top_geom[-1][0]))
@@ -2150,6 +2120,15 @@ class StrutEngine:
             else:
                 cursor += 1
         return pairs
+
+    def _adjacent_strut_pairs(
+        self,
+        struts: list[dict[str, Any]],
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        return [
+            (struts[index], struts[index + 1])
+            for index in range(0, len(struts) - 1, 2)
+        ]
 
     def _coupling_positions(self, lo: float, hi: float) -> list[float]:
         span = hi - lo

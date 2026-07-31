@@ -807,6 +807,76 @@ def test_large_brace_internal_ties_are_perpendicular_couplings() -> None:
     assert lacing == []
 
 
+def test_straight_truss_uses_non_overlapping_pair_coupling_ties() -> None:
+    case = next(case for case in CASES if case.name == "straight_truss_rect")
+    layout = solve_case(case)
+    logical_main = _logical_members([
+        member for member in layout["members"] if member["kind"] == "main_strut"
+    ])
+
+    for main_orientation, tie_orientation, coordinate_index in (
+        ("vertical", "horizontal", 0),
+        ("horizontal", "vertical", 1),
+    ):
+        axes = sorted({
+            round(member["geometry"][0][coordinate_index], 6)
+            for member in logical_main
+            if (
+                _is_vertical(member)
+                if main_orientation == "vertical"
+                else _is_horizontal(member)
+            )
+        })
+        expected_pairs = {
+            (axes[index], axes[index + 1])
+            for index in range(0, len(axes) - 1, 2)
+        }
+        actual_pairs = {
+            tuple(sorted((
+                round(member["geometry"][0][coordinate_index], 6),
+                round(member["geometry"][-1][coordinate_index], 6),
+            )))
+            for member in layout["members"]
+            if member["kind"] == "tie"
+            and (
+                _is_horizontal(member)
+                if tie_orientation == "horizontal"
+                else _is_vertical(member)
+            )
+        }
+
+        assert expected_pairs
+        assert actual_pairs == expected_pairs
+
+
+def test_edge_truss_panel_lengths_are_mirrored_and_compact() -> None:
+    for case_name in ("straight_truss_rect", "large_rect_120x80_brace"):
+        case = next(case for case in CASES if case.name == case_name)
+        layout = solve_case(case)
+        edge_sequences = [
+            _edge_truss_projected_panel_lengths(layout, edge_index)
+            for edge_index in range(1, 5)
+        ]
+
+        assert all(edge_sequences), case_name
+        assert len(edge_sequences[0]) == len(edge_sequences[2]), case_name
+        assert len(edge_sequences[1]) == len(edge_sequences[3]), case_name
+        assert all(
+            abs(left - right) <= 2e-6
+            for left, right in zip(edge_sequences[0], edge_sequences[2])
+        ), case_name
+        assert all(
+            abs(left - right) <= 2e-6
+            for left, right in zip(edge_sequences[1], edge_sequences[3])
+        ), case_name
+        for sequence in edge_sequences:
+            assert all(
+                abs(left - right) <= 2e-6
+                for left, right in zip(sequence, reversed(sequence))
+            ), (case_name, sequence)
+            assert max(sequence) <= case.params.get("truss_panel_max", 9.0) + 1e-6
+
+
 def test_large_brace_horizontal_main_group_uses_perpendicular_couplings() -> None:
     case = next(case for case in CASES if case.name == "large_rect_120x80_brace")
     layout = solve_case(case)
@@ -1906,6 +1976,30 @@ def _max_edge_truss_station_gap(layout: dict[str, Any]) -> float:
         unique = sorted({round(position, 6) for position in positions})
         gaps.extend(right - left for left, right in zip(unique, unique[1:]))
     return max(gaps, default=inf)
+
+
+def _edge_truss_projected_panel_lengths(
+    layout: dict[str, Any],
+    edge_index: int,
+) -> list[float]:
+    start = layout["waling"][edge_index - 1]
+    end = layout["waling"][edge_index]
+    edge = LineString([start, end])
+    panels: list[tuple[float, float]] = []
+    for member in _logical_members(layout["members"]):
+        if (
+            member.get("edge_truss_id") != f"edge_truss_{edge_index}"
+            or member.get("edge_role") != "web"
+        ):
+            continue
+        geometry = member.get("logical_geometry", member["geometry"])
+        positions = sorted(
+            float(edge.project(Point(point)))
+            for point in (geometry[0], geometry[-1])
+        )
+        panels.append((positions[0], positions[-1]))
+    panels.sort()
+    return [round(end_pos - start_pos, 6) for start_pos, end_pos in panels]
 
 
 def _large_brace_outer_edge_chords(layout: dict[str, Any]) -> list[dict[str, Any]]:
