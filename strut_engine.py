@@ -359,7 +359,6 @@ class StrutEngine:
         include_y: bool,
     ) -> list[dict[str, Any]]:
         bounds = waling_poly.bounds
-        min_len = self.params["min_strut_len"]
         struts: list[dict[str, Any]] = []
         x_grid = self._support_grid_positions(bounds[0], bounds[2])
         y_grid = self._support_grid_positions(bounds[1], bounds[3])
@@ -367,7 +366,7 @@ class StrutEngine:
         if include_x:
             for x_val in x_grid:
                 line = LineString([(x_val, bounds[1] - self.params["spacing"]), (x_val, bounds[3] + self.params["spacing"])])
-                for seg in _unwrap_lines(waling_poly.intersection(line), min_len):
+                for seg in self._visible_support_segments(waling_poly, line):
                     member = self._add_linear_member(
                         layout,
                         "main_strut",
@@ -381,7 +380,7 @@ class StrutEngine:
         if include_y:
             for y_val in y_grid:
                 line = LineString([(bounds[0] - self.params["spacing"], y_val), (bounds[2] + self.params["spacing"], y_val)])
-                for seg in _unwrap_lines(waling_poly.intersection(line), min_len):
+                for seg in self._visible_support_segments(waling_poly, line):
                     member = self._add_linear_member(
                         layout,
                         "main_strut",
@@ -401,7 +400,6 @@ class StrutEngine:
         waling_poly: Polygon,
     ) -> list[dict[str, Any]]:
         bounds = waling_poly.bounds
-        min_len = self.params["min_strut_len"]
         struts: list[dict[str, Any]] = []
         x_grid = self._support_grid_positions(bounds[0], bounds[2])
         y_grid = self._support_grid_positions(bounds[1], bounds[3])
@@ -418,7 +416,7 @@ class StrutEngine:
             clipped = waling_poly.intersection(line)
             if clipped.intersection(corner_zone).length > 1e-6:
                 continue
-            for seg in _unwrap_lines(clipped, min_len):
+            for seg in self._visible_support_segments(waling_poly, line):
                 member = self._add_linear_member(
                     layout,
                     "main_strut",
@@ -437,7 +435,7 @@ class StrutEngine:
             clipped = waling_poly.intersection(line)
             if clipped.intersection(corner_zone).length > 1e-6:
                 continue
-            for seg in _unwrap_lines(clipped, min_len):
+            for seg in self._visible_support_segments(waling_poly, line):
                 member = self._add_linear_member(
                     layout,
                     "main_strut",
@@ -450,6 +448,23 @@ class StrutEngine:
 
         self._add_main_strut_cross_nodes(layout)
         return struts
+
+    def _visible_support_segments(
+        self,
+        waling_poly: Polygon,
+        line: LineString,
+    ) -> list[LineString]:
+        """Return first-visible waling spans that do not lie on excavation edges."""
+        excavation_boundary = self.poly.boundary
+        return [
+            segment
+            for segment in _unwrap_lines(
+                waling_poly.intersection(line),
+                float(self.params["min_strut_len"]),
+            )
+            if segment.intersection(excavation_boundary).length <= 1e-6
+            and not _line_is_collinear_with_boundary(segment, excavation_boundary)
+        ]
 
     def _large_brace_main_strut_axes(
         self,
@@ -3215,6 +3230,11 @@ def _unwrap_lines(geom: Any, min_len: float) -> list[LineString]:
     if isinstance(geom, MultiLineString):
         return [line for line in geom.geoms if line.length >= min_len]
     return []
+
+
+def _line_is_collinear_with_boundary(line: LineString, boundary: Any) -> bool:
+    overlap = line.intersection(boundary)
+    return not overlap.is_empty and overlap.length > 1e-6
 
 
 def _horizontal_span_across_polygon(
