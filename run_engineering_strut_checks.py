@@ -32,6 +32,16 @@ class Case:
 
 CASES = [
     Case(
+        "l_shape_brace_60x40",
+        [(0, 0), (60, 0), (60, 20), (30, 20), (30, 40), (0, 40)],
+        {
+            "support_system": "brace",
+            "spacing": 9.0,
+            "waling_offset": 2.0,
+            "safe_dist": 1.5,
+        },
+    ),
+    Case(
         "opposite_strut_60x40",
         [(0, 0), (60, 0), (60, 40), (0, 40)],
         {
@@ -161,7 +171,7 @@ def _print_summary_and_check(
 
     failures += _check(report["ok"], f"geometry validation OK; issues={report['issues'][:5]}")
 
-    if case.params["support_system"] in {"brace", "straight_truss"}:
+    if case.params["support_system"] in {"brace", "straight_truss"} and case.name != "l_shape_brace_60x40":
         failures += _check_corner_bracket_geometry(case, layout)
         failures += _check_main_truss_crossing_vertices(layout)
         failures += _check_pair_scoped_ties(case, layout)
@@ -188,6 +198,53 @@ def _print_summary_and_check(
         failures += _check(stats["ring_strut_length"] > 0, "circular support has ring strut length")
         failures += _check(stats["radial_strut_length"] > 0, "circular support has radial strut length")
 
+    if case.name == "l_shape_brace_60x40":
+        failures += _check_l_shape_support(case, layout)
+
+    return failures
+
+
+def _check_l_shape_support(case: Case, layout: dict[str, Any]) -> int:
+    excavation_boundary = Polygon(case.coords).boundary
+    main = [member for member in layout["members"] if member["kind"] == "main_strut"]
+    conversion = [member for member in layout["members"] if member.get("conversion_group")]
+    inner_edge_ids = {
+        member.get("edge_truss_id")
+        for member in layout["members"]
+        if member["kind"] == "truss_chord" and member.get("edge_role") == "inner_chord"
+    }
+    waling = [member for member in layout["members"] if member["kind"] == "waling"]
+    failures = _check(bool(main), "L-shaped pit has visible opposite struts")
+    failures += _check(
+        all(LineString(member["geometry"]).intersection(excavation_boundary).length <= 1e-6 for member in main),
+        "L-shaped main struts do not overlap excavation edges",
+    )
+    failures += _check(
+        inner_edge_ids == {f"edge_truss_{index}" for index in range(1, 7)},
+        "L-shaped perimeter truss covers all six boundary edges",
+    )
+    failures += _check(
+        len({member.get("conversion_group") for member in conversion}) == 1
+        and {member.get("conversion_group") for member in conversion} == {"reentrant_1"},
+        "L-shaped pit has exactly one concave conversion group",
+    )
+    failures += _check(
+        all(member.get("corner_class") == "concave" for member in conversion),
+        "L-shaped conversion members are concave-only",
+    )
+    failures += _check(
+        bool(waling)
+        and all("edge_truss_outer_chord" in member.get("structural_roles", []) for member in waling),
+        "L-shaped waling is the physical outer chord",
+    )
+    failures += _check(
+        not any(
+            member["kind"] == "corner"
+            and LineString(member["geometry"]).distance(Point(30.0, 20.0)) <= 2.0
+            for member in layout["members"]
+        ),
+        "re-entrant vertex has no convex-corner brace",
+    )
     return failures
 
 

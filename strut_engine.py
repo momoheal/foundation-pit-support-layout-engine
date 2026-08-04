@@ -469,6 +469,16 @@ class StrutEngine:
         line: LineString,
     ) -> list[LineString]:
         """Return first-visible waling spans that do not lie on excavation edges."""
+        if self.params.get("support_system") not in {"brace", "straight_truss"}:
+            return _unwrap_lines(
+                waling_poly.intersection(line),
+                float(self.params["min_strut_len"]),
+            )
+        if self.poly.convex_hull.area - self.poly.area <= max(self.poly.area * 0.02, 1e-6):
+            return _unwrap_lines(
+                waling_poly.intersection(line),
+                float(self.params["min_strut_len"]),
+            )
         excavation_boundary = self.poly.boundary
         return [
             segment
@@ -3033,6 +3043,18 @@ class StrutEngine:
                 self._add_node(layout, point, "strut_cross", [left["id"], right["id"]])
 
     def _place_pillars_from_nodes(self, layout: dict[str, Any], waling_poly: Polygon) -> None:
+        # Main-strut cross nodes may have been registered before a perimeter
+        # truss replaced one of the crossing members.  Reconcile the label
+        # against the final topology so collinear split endpoints cannot turn
+        # into pillar candidates.
+        for node in layout["nodes"]:
+            if "strut_cross" not in node["kind"]:
+                continue
+            if self._node_has_final_main_crossing(layout, node["pos"]):
+                continue
+            node["kind"] = "|".join(
+                token for token in node["kind"].split("|") if token != "strut_cross"
+            ) or "truss_node"
         candidates = []
         for node in layout["nodes"]:
             kind = node["kind"]
@@ -3057,6 +3079,39 @@ class StrutEngine:
                 continue
             selected.append(point)
         layout["pillars"] = selected
+
+    def _node_has_final_main_crossing(
+        self,
+        layout: dict[str, Any],
+        point: Point2D,
+    ) -> bool:
+        """Return whether ``point`` is a non-collinear final main-strut crossing."""
+        anchor = Point(point)
+        covering = [
+            member
+            for member in layout["members"]
+            if member["kind"] == "main_strut"
+            and LineString(member["geometry"]).distance(anchor) <= 1e-6
+        ]
+        for index, left in enumerate(covering):
+            left_line = LineString(left["geometry"])
+            for right in covering[index + 1:]:
+                inter = left_line.intersection(LineString(right["geometry"]))
+                if inter.geom_type == "Point" and inter.distance(anchor) <= 1e-6:
+                    left_coords = left_line.coords
+                    right_coords = LineString(right["geometry"]).coords
+                    left_vec = (
+                        left_coords[-1][0] - left_coords[0][0],
+                        left_coords[-1][1] - left_coords[0][1],
+                    )
+                    right_vec = (
+                        right_coords[-1][0] - right_coords[0][0],
+                        right_coords[-1][1] - right_coords[0][1],
+                    )
+                    cross = left_vec[0] * right_vec[1] - left_vec[1] * right_vec[0]
+                    if abs(cross) > 1e-9:
+                        return True
+        return False
 
     # ------------------------------------------------------------------
     # Validation and statistics

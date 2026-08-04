@@ -1517,6 +1517,31 @@ def test_l_shape_reentrant_corner_uses_one_registered_conversion_group() -> None
     )
 
 
+def test_l_shape_pillars_only_use_final_non_collinear_main_strut_crossings() -> None:
+    layout = _l_shape_layout()
+    main_struts = [
+        member for member in layout["members"] if member["kind"] == "main_strut"
+    ]
+
+    for pillar in layout["pillars"]:
+        point = Point(pillar)
+        covering = [
+            member
+            for member in main_struts
+            if _member_line(member).distance(point) <= 1e-6
+        ]
+        assert any(
+            abs(
+                (left["geometry"][-1][0] - left["geometry"][0][0])
+                * (right["geometry"][-1][1] - right["geometry"][0][1])
+                - (left["geometry"][-1][1] - left["geometry"][0][1])
+                * (right["geometry"][-1][0] - right["geometry"][0][0])
+            ) > 1e-9
+            for index, left in enumerate(covering)
+            for right in covering[index + 1:]
+        )
+
+
 def test_validation_rejects_main_strut_overlapping_excavation_boundary() -> None:
     case = next(case for case in CASES if case.name == "l_shape")
     layout = solve_case(case)
