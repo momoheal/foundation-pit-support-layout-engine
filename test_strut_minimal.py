@@ -1474,16 +1474,27 @@ def test_l_shape_edge_truss_covers_every_waling_edge() -> None:
     layout = _l_shape_layout()
     waling = list(Polygon(layout["waling"]).exterior.coords)
     edges = [LineString([start, end]) for start, end in zip(waling, waling[1:])]
-    outer_chords = [
-        _member_line(member)
-        for member in layout["members"]
-        if member["kind"] == "truss_chord" and member.get("truss_role") == "outer_chord"
+    waling_members = [
+        member for member in layout["members"]
+        if member["kind"] == "waling"
     ]
+    edge_ids = {
+        member["edge_truss_id"]
+        for member in layout["members"]
+        if member["kind"] == "truss_chord" and member.get("edge_role") == "inner_chord"
+    }
 
     assert len(edges) == 6
-    assert outer_chords
-    coverage = unary_union(outer_chords).buffer(1e-6)
+    assert waling_members
+    assert all(
+        "edge_truss_outer_chord" in member.get("structural_roles", [])
+        for member in waling_members
+    )
+    coverage = unary_union([
+        _member_line(member) for member in waling_members
+    ]).buffer(1e-6)
     assert all(coverage.covers(edge) for edge in edges)
+    assert edge_ids == {f"edge_truss_{index}" for index in range(1, 7)}
 
 
 def test_l_shape_reentrant_corner_uses_one_registered_conversion_group() -> None:

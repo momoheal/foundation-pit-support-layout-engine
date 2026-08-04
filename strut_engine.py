@@ -270,9 +270,23 @@ class StrutEngine:
 
     def solve_brace(self, layout: dict[str, Any]) -> None:
         waling_poly = self._place_waling(layout)
-        if self._uses_large_corner_truss(waling_poly):
-            struts = self._place_main_struts_avoiding_corner_coverage(layout, waling_poly)
-            corner_model = self._place_discrete_edge_trusses(layout, waling_poly)
+        uses_perimeter_truss = self._uses_boundary_driven_perimeter_truss(waling_poly)
+        uses_large_corner_truss = self._uses_large_corner_truss(waling_poly)
+        if uses_perimeter_truss:
+            if uses_large_corner_truss:
+                struts = self._place_main_struts_avoiding_corner_coverage(layout, waling_poly)
+            else:
+                struts = self._place_main_struts(
+                    layout,
+                    waling_poly,
+                    include_x=True,
+                    include_y=True,
+                )
+            corner_model = self._place_discrete_edge_trusses(
+                layout,
+                waling_poly,
+                preserve_main_struts=not uses_large_corner_truss,
+            )
             self._place_modular_corner_assemblies(layout, waling_poly, corner_model)
             self._place_perimeter_truss_stiffening(layout, waling_poly)
             self._place_truss_coupling_ties(layout, struts, waling_poly)
@@ -280,7 +294,7 @@ class StrutEngine:
             struts = self._place_main_struts(layout, waling_poly, include_x=True, include_y=True)
             self._place_single_direction_ties(layout, struts, waling_poly)
         self._place_secondary_perimeter_supports(layout, waling_poly)
-        if self._uses_large_corner_truss(waling_poly):
+        if uses_perimeter_truss:
             pass
         else:
             self._place_corner_struts(layout, waling_poly)
@@ -521,12 +535,13 @@ class StrutEngine:
         self,
         layout: dict[str, Any],
         waling_poly: Polygon,
+        *,
+        preserve_main_struts: bool = False,
     ) -> dict[str, Any]:
         """Build one straight inner chord and middle web field per waling edge."""
         corners = _open_coords(_closed_coords(list(waling_poly.exterior.coords)))
         if len(corners) < 3:
             return {"corners": [], "inner_lines": []}
-        centroid = (float(waling_poly.centroid.x), float(waling_poly.centroid.y))
         configured_spacing = self.params.get("corner_truss_tier_spacing")
         depth = (
             float(configured_spacing)
@@ -538,7 +553,10 @@ class StrutEngine:
             )
         )
         panel_max = self._edge_truss_panel_limit(depth)
-        requested_tiers = int(self.params["corner_truss_tier_count"])
+        requested_tiers = min(
+            int(self.params["corner_truss_tier_count"]),
+            2 if preserve_main_struts else int(self.params["corner_truss_tier_count"]),
+        )
         inner_lines: list[Geometry] = []
 
         for index, outer_start in enumerate(corners):
@@ -548,11 +566,17 @@ class StrutEngine:
             if edge.length <= 1e-9:
                 inner_lines.append([])
                 continue
-            inward = _inward_unit_normal(outer_start, outer_end, centroid)
+            inward = _polygon_inward_unit_normal(outer_start, outer_end, waling_poly, depth)
             inner_start = _offset_point(outer_start, inward, depth)
             inner_end = _offset_point(outer_end, inward, depth)
             inner_geometry = [inner_start, inner_end]
             inner_lines.append(inner_geometry)
+
+        conversion_groups = self._connect_reentrant_inner_chords(
+            waling_poly,
+            corners,
+            inner_lines,
+        )
 
         replaced_main_strut_ids = {
             str(member["id"])
@@ -566,12 +590,12 @@ class StrutEngine:
                     for inner_geometry in inner_lines
                     if len(inner_geometry) >= 2
                 )
-                or any(
+                or (not preserve_main_struts and any(
                     waling_poly.exterior.distance(Point(endpoint)) <= 1e-6
                     and min(Point(endpoint).distance(Point(corner)) for corner in corners)
                     < requested_tiers * depth - 1e-6
                     for endpoint in (member["geometry"][0], member["geometry"][-1])
-                )
+                ))
             )
         }
         self._remove_layout_members(layout, replaced_main_strut_ids)
@@ -653,6 +677,21 @@ class StrutEngine:
                     },
                 )
 
+        for conversion in conversion_groups:
+            self._add_linear_member(
+                layout,
+                "truss_web",
+                [conversion["corner"], conversion["shared"]],
+                old_key=None,
+                node_kind="truss_node",
+                attributes={
+                    "conversion_group": conversion["group_id"],
+                    "corner_class": "concave",
+                    "edge_role": "conversion_web",
+                    "truss_primitive": "panel",
+                },
+            )
+
         corner_models: list[dict[str, Any]] = []
         for index, corner in enumerate(corners):
             prev_pt = corners[index - 1]
@@ -681,8 +720,51 @@ class StrutEngine:
             "corners": corner_models,
             "inner_lines": inner_lines,
             "depth": depth,
+            "tier_limit": requested_tiers,
             "replaced_main_strut_ids": sorted(replaced_main_strut_ids),
         }
+
+    def _connect_reentrant_inner_chords(
+        self,
+        waling_poly: Polygon,
+        corners: Geometry,
+        inner_lines: list[Geometry],
+    ) -> list[dict[str, Any]]:
+        span = max(
+            waling_poly.bounds[2] - waling_poly.bounds[0],
+            waling_poly.bounds[3] - waling_poly.bounds[1],
+        ) * 2.0
+        groups: list[dict[str, Any]] = []
+        group_index = 0
+        for index, corner in enumerate(corners):
+            prev_pt = corners[index - 1]
+            next_pt = corners[(index + 1) % len(corners)]
+            if _is_convex_corner(prev_pt, corner, next_pt, waling_poly):
+                continue
+            previous_inner = inner_lines[index - 1]
+            following_inner = inner_lines[index]
+            if len(previous_inner) < 2 or len(following_inner) < 2:
+                continue
+            intersection = _extended_line(
+                previous_inner[0], previous_inner[-1], span,
+            ).intersection(_extended_line(
+                following_inner[0], following_inner[-1], span,
+            ))
+            if not isinstance(intersection, Point):
+                continue
+            shared = (float(intersection.x), float(intersection.y))
+            diagonal = LineString([corner, shared])
+            if not waling_poly.buffer(1e-6).covers(diagonal):
+                continue
+            previous_inner[-1] = shared
+            following_inner[0] = shared
+            group_index += 1
+            groups.append({
+                "group_id": f"reentrant_{group_index}",
+                "corner": corner,
+                "shared": shared,
+            })
+        return groups
 
     def _place_modular_corner_assemblies(
         self,
@@ -695,7 +777,10 @@ class StrutEngine:
         default_spacing = float(corner_model.get("depth", self._edge_truss_depth()))
         configured_spacing = self.params.get("corner_truss_tier_spacing")
         spacing = float(configured_spacing) if configured_spacing is not None else default_spacing
-        requested = int(self.params["corner_truss_tier_count"])
+        requested = min(
+            int(self.params["corner_truss_tier_count"]),
+            int(corner_model.get("tier_limit", self.params["corner_truss_tier_count"])),
+        )
 
         for corner in corner_model.get("corners", []):
             legal_count = int(min(corner["prev_length"], corner["next_length"]) // spacing)
@@ -1780,6 +1865,13 @@ class StrutEngine:
             waling_poly.bounds[2] - waling_poly.bounds[0],
             waling_poly.bounds[3] - waling_poly.bounds[1],
         ) >= 80.0
+
+    def _uses_boundary_driven_perimeter_truss(self, waling_poly: Polygon) -> bool:
+        nonconvex_area = waling_poly.convex_hull.area - waling_poly.area
+        return self._uses_large_corner_truss(waling_poly) or nonconvex_area > max(
+            waling_poly.area * 0.02,
+            1e-6,
+        )
 
     def _place_truss_coupling_ties(
         self,
@@ -3296,6 +3388,26 @@ def _inward_unit_normal(
     return normal_b
 
 
+def _polygon_inward_unit_normal(
+    start: Point2D,
+    end: Point2D,
+    polygon: Polygon,
+    depth: float,
+) -> Point2D:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = (dx * dx + dy * dy) ** 0.5
+    if length <= 1e-9:
+        return (0.0, 0.0)
+    candidates = [(-dy / length, dx / length), (dy / length, -dx / length)]
+    midpoint = _line_midpoint((start, end))
+    for normal in candidates:
+        probe = _offset_point(midpoint, normal, min(depth, 0.25))
+        if polygon.buffer(1e-6).covers(Point(probe)):
+            return normal
+    raise ValueError(f"no inward normal for waling edge {start!r}->{end!r}")
+
+
 def _unit_vector(start: Point2D, end: Point2D) -> Point2D:
     dx = end[0] - start[0]
     dy = end[1] - start[1]
@@ -3303,6 +3415,14 @@ def _unit_vector(start: Point2D, end: Point2D) -> Point2D:
     if length <= 1e-9:
         return (0.0, 0.0)
     return (dx / length, dy / length)
+
+
+def _extended_line(start: Point2D, end: Point2D, extension: float) -> LineString:
+    direction = _unit_vector(start, end)
+    return LineString([
+        _offset_point(start, direction, -extension),
+        _offset_point(end, direction, extension),
+    ])
 
 
 def _point_along(start: Point2D, target: Point2D, distance: float) -> Point2D:
