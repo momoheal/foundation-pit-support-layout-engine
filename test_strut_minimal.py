@@ -1517,6 +1517,55 @@ def test_l_shape_reentrant_corner_uses_one_registered_conversion_group() -> None
     )
 
 
+def test_validation_rejects_main_strut_overlapping_excavation_boundary() -> None:
+    case = next(case for case in CASES if case.name == "l_shape")
+    layout = solve_case(case)
+    layout["members"].append({
+        "id": "M_BAD_EDGE",
+        "kind": "main_strut",
+        "system": "brace",
+        "start": "N_BAD_1",
+        "end": "N_BAD_2",
+        "geometry": [(30.0, 20.0), (30.0, 40.0)],
+        "width": 0.8,
+        "material": "steel",
+    })
+
+    report = validate_layout(
+        layout,
+        {**case.params, "excavation_coords": case.coords},
+    )
+    assert not report["ok"]
+    assert any(
+        issue["reason"] == "member_overlaps_excavation_boundary"
+        for issue in report["issues"]
+    )
+
+
+def test_validation_rejects_unregistered_conversion_endpoint() -> None:
+    case = next(case for case in CASES if case.name == "l_shape")
+    layout = solve_case(case)
+    conversion = next(
+        member for member in layout["members"]
+        if member.get("conversion_group") == "reentrant_1"
+    )
+    missing = conversion["geometry"][-1]
+    layout["nodes"] = [
+        node for node in layout["nodes"]
+        if Point(node["pos"]).distance(Point(missing)) > 1e-6
+    ]
+
+    report = validate_layout(
+        layout,
+        {**case.params, "excavation_coords": case.coords},
+    )
+    assert not report["ok"]
+    assert any(
+        issue["reason"] == "conversion_endpoint_unregistered"
+        for issue in report["issues"]
+    )
+
+
 def test_octagonal_pit_gets_secondary_perimeter_supports() -> None:
     case = next(case for case in CASES if case.name == "octagon_cut")
     params = dict(case.params)

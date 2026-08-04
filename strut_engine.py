@@ -3099,7 +3099,9 @@ class StrutEngine:
         try:
             from strut_validation import validate_layout
 
-            report = validate_layout(layout, self.params)
+            validation_params = dict(self.params)
+            validation_params["excavation_coords"] = list(self.coords)
+            report = validate_layout(layout, validation_params)
         except Exception as exc:  # pragma: no cover - validation must not hide layout generation.
             layout["issues"] = [{
                 "kind": "validation_error",

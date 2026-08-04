@@ -590,10 +590,58 @@ def validate_edge_truss_corner_topology(
     return issues
 
 
+def validate_excavation_boundary_clearance(
+    layout: dict[str, Any],
+    params: dict[str, Any] | None,
+) -> list[ValidationIssue]:
+    if not params or not params.get("excavation_coords"):
+        return []
+    boundary = Polygon(params["excavation_coords"]).boundary
+    issues: list[ValidationIssue] = []
+    for ref in collect_segments(layout):
+        if ref.kind != "main_strut":
+            continue
+        overlap = ref.line.intersection(boundary)
+        if overlap.is_empty or overlap.length <= 1e-6:
+            continue
+        point = ref.line.interpolate(0.5, normalized=True)
+        issues.append(ValidationIssue(
+            ref.kind,
+            ref.member_id,
+            None,
+            (float(point.x), float(point.y)),
+            "member_overlaps_excavation_boundary",
+            "error",
+        ))
+    return issues
+
+
+def validate_conversion_endpoints(layout: dict[str, Any]) -> list[ValidationIssue]:
+    nodes = [tuple(node["pos"]) for node in layout.get("nodes", [])]
+    issues: list[ValidationIssue] = []
+    for member in layout.get("members", []):
+        if not member.get("conversion_group"):
+            continue
+        for endpoint in (member["geometry"][0], member["geometry"][-1]):
+            if any(points_close(endpoint, node) for node in nodes):
+                continue
+            issues.append(ValidationIssue(
+                str(member.get("kind", "unknown")),
+                str(member.get("id")),
+                None,
+                (float(endpoint[0]), float(endpoint[1])),
+                "conversion_endpoint_unregistered",
+                "error",
+            ))
+    return issues
+
+
 def validate_layout(layout: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
     issues = []
     issues.extend(validate_member_bounds(layout, params))
     issues.extend(validate_member_endpoint_anchors(layout, params))
+    issues.extend(validate_conversion_endpoints(layout))
+    issues.extend(validate_excavation_boundary_clearance(layout, params))
     issues.extend(validate_structural_connectivity(layout, params))
     issues.extend(validate_large_brace_topology(layout, params))
     issues.extend(validate_large_brace_clearance(layout, params))
