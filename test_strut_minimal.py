@@ -17,6 +17,7 @@ from typing import Any
 import ezdxf
 import strut_diagnostics
 from shapely.geometry import LineString, Point, Polygon
+from shapely.ops import unary_union
 
 from main_strut import export_strut_dxf
 from strut_engine import STATS_KEYS, StrutEngine
@@ -24,6 +25,7 @@ from strut_validation import validate_layout
 
 
 TMP_ROOT = Path(__file__).resolve().parent / ".tmp_pytest"
+L_SHAPE_COORDS = [(0, 0), (60, 0), (60, 20), (30, 20), (30, 40), (0, 40)]
 
 
 @dataclass(frozen=True)
@@ -41,7 +43,7 @@ CASES = [
     ),
     Case(
         "l_shape",
-        [(0, 0), (60, 0), (60, 20), (30, 20), (30, 40), (0, 40)],
+        L_SHAPE_COORDS,
         {"support_system": "brace", "spacing": 9.0, "waling_offset": 2.0, "safe_dist": 1.5},
     ),
     Case(
@@ -128,6 +130,17 @@ CASES = [
 
 def solve_case(case: Case) -> dict:
     return StrutEngine(case.coords, case.params).solve()
+
+
+def _l_shape_layout() -> dict[str, Any]:
+    return StrutEngine(
+        L_SHAPE_COORDS,
+        {"support_system": "brace", "spacing": 9.0, "waling_offset": 2.0, "safe_dist": 1.5},
+    ).solve()
+
+
+def _member_line(member: dict[str, Any]) -> LineString:
+    return LineString(member["geometry"])
 
 
 def test_parameter_governance() -> None:
@@ -1421,6 +1434,76 @@ def test_main_struts_are_clipped_inside_non_rectangular_wale() -> None:
             waling_poly.buffer(1e-6).covers(LineString(member["geometry"]))
             for member in main_struts
         ), name
+
+
+def test_l_shape_main_struts_use_visible_opposite_waling_only() -> None:
+    layout = _l_shape_layout()
+    excavation_boundary = Polygon(L_SHAPE_COORDS).boundary
+    main_struts = [member for member in layout["members"] if member["kind"] == "main_strut"]
+
+    assert main_struts
+    assert all(
+        _member_line(member).intersection(excavation_boundary).length <= 1e-6
+        for member in main_struts
+    )
+    assert not any(
+        _is_vertical(member)
+        and all(abs(point[0] - 30.0) <= 1e-6 for point in member["geometry"])
+        for member in main_struts
+    )
+    assert not any(
+        _is_horizontal(member)
+        and all(abs(point[1] - 20.0) <= 1e-6 for point in member["geometry"])
+        for member in main_struts
+    )
+
+
+def test_l_shape_has_separate_long_and_short_arm_strut_fields() -> None:
+    layout = _l_shape_layout()
+    waling = Polygon(layout["waling"])
+    main_struts = [member for member in layout["members"] if member["kind"] == "main_strut"]
+    vertical = [member for member in main_struts if _is_vertical(member)]
+    horizontal = [member for member in main_struts if _is_horizontal(member)]
+
+    assert any(_member_line(member).bounds[3] > 20.0 + 1e-6 for member in vertical)
+    assert any(_member_line(member).bounds[2] > 30.0 + 1e-6 for member in horizontal)
+    assert all(waling.buffer(1e-6).covers(_member_line(member)) for member in main_struts)
+
+
+def test_l_shape_edge_truss_covers_every_waling_edge() -> None:
+    layout = _l_shape_layout()
+    waling = list(Polygon(layout["waling"]).exterior.coords)
+    edges = [LineString([start, end]) for start, end in zip(waling, waling[1:])]
+    outer_chords = [
+        _member_line(member)
+        for member in layout["members"]
+        if member["kind"] == "truss_chord" and member.get("truss_role") == "outer_chord"
+    ]
+
+    assert len(edges) == 6
+    assert outer_chords
+    coverage = unary_union(outer_chords).buffer(1e-6)
+    assert all(coverage.covers(edge) for edge in edges)
+
+
+def test_l_shape_reentrant_corner_uses_one_registered_conversion_group() -> None:
+    layout = _l_shape_layout()
+    nodes = [Point(node["pos"]) for node in layout["nodes"]]
+    conversion_members = [
+        member for member in layout["members"]
+        if member.get("conversion_group") == "reentrant_1"
+    ]
+
+    assert conversion_members
+    assert all(member.get("corner_class") == "concave" for member in conversion_members)
+    assert all(
+        all(any(Point(endpoint).distance(node) <= 1e-6 for node in nodes) for endpoint in member["geometry"])
+        for member in conversion_members
+    )
+    assert not any(
+        member["kind"] == "corner" and _member_line(member).distance(Point(30.0, 20.0)) <= 2.0
+        for member in layout["members"]
+    )
 
 
 def test_octagonal_pit_gets_secondary_perimeter_supports() -> None:
