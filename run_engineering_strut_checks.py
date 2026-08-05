@@ -215,10 +215,10 @@ def _check_l_shape_support(case: Case, layout: dict[str, Any]) -> int:
         if member["kind"] == "truss_chord" and member.get("edge_role") == "inner_chord"
     }
     waling = [member for member in layout["members"] if member["kind"] == "waling"]
-    conversion_web = next((
+    conversion_member = next((
         member
         for member in conversion
-        if member.get("edge_role") == "conversion_web"
+        if member.get("support_role") == "reentrant_opposite_strut"
     ), None)
     outer_transfer = [
         member
@@ -248,9 +248,13 @@ def _check_l_shape_support(case: Case, layout: dict[str, Any]) -> int:
         all(member.get("corner_class") == "concave" for member in conversion),
         "L-shaped conversion members are concave-only",
     )
-    if conversion_web is not None:
-        corner = conversion_web["geometry"][0]
-        shared = conversion_web["geometry"][-1]
+    failures += _check(
+        not any(member["kind"] == "truss_web" for member in conversion),
+        "L-shaped conversion has no corner-origin web ray",
+    )
+    if conversion_member is not None:
+        corner = conversion_member["conversion_corner"]
+        shared = conversion_member["conversion_shared"]
         min_x, min_y, max_x, max_y = Polygon(layout["waling"]).bounds
         outer_geometry = unary_union([
             LineString(member["geometry"]) for member in outer_transfer
@@ -271,7 +275,53 @@ def _check_l_shape_support(case: Case, layout: dict[str, Any]) -> int:
             "L-shaped inner chords continue as paired opposite struts",
         )
     else:
-        failures += _check(False, "L-shaped high-force corner has a conversion web")
+        failures += _check(False, "L-shaped high-force corner has a conversion member")
+    failures += _check(
+        all(
+            member.get("support_role") == "reentrant_opposite_strut"
+            for member in [*outer_transfer, *inner_transfer]
+        ),
+        "L-shaped outer struts and inner chords share the opposite-strut role",
+    )
+    edge_webs = [
+        member for member in layout["members"]
+        if member["kind"] == "truss_web" and member.get("edge_role") == "web"
+    ]
+    failures += _check(
+        all(
+            any(
+                other["id"] != web["id"]
+                and LineString(other["geometry"]).distance(Point(endpoint)) <= 1e-6
+                for other in layout["members"]
+            )
+            for web in edge_webs
+            for endpoint in (web["geometry"][0], web["geometry"][-1])
+        ),
+        "L-shaped edge-web endpoints have no chord/support gap",
+    )
+    failures += _check(
+        all(
+            intersection.is_empty
+            or (
+                intersection.geom_type == "Point"
+                and any(
+                    Point(intersection).distance(Point(endpoint)) <= 1e-6
+                    for endpoint in (web["geometry"][0], web["geometry"][-1])
+                )
+            )
+            for web in edge_webs
+            for support in main
+            for intersection in [
+                LineString(web["geometry"]).intersection(LineString(support["geometry"]))
+            ]
+        ),
+        "L-shaped edge webs meet supports only at registered nodes",
+    )
+    apex_angles = _edge_truss_v_apex_angles(layout)
+    failures += _check(
+        bool(apex_angles) and min(apex_angles) >= 30.0 - 1e-4,
+        f"L-shaped edge-web apex angles use eight-brace nodes; min={min(apex_angles, default=0.0):.3f}",
+    )
     failures += _check(
         bool(waling)
         and all("edge_truss_outer_chord" in member.get("structural_roles", []) for member in waling),

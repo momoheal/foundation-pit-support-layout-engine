@@ -46,14 +46,16 @@ load paths:
   not a separate short link;
 - register the crossings of the two axes and the inner-chord common node, so
   the corner transfer is a compact two-direction structural cell;
-- retain at most one explicit conversion web across that cell, only between
-  registered nodes and never as the sole load path.
+- do not emit a ray from the geometric corner. Any secondary web must connect
+  existing paired-axis intersection nodes; the paired axes themselves are the
+  conversion load path.
 
 The outer extension is a `main_strut` continuation of the waling axis. The
 inner extension remains the physical `truss_chord` member and additionally
-carries the structural role `reentrant_opposite_strut`; coincident duplicate
-members are forbidden. The concave vertex is never treated as a convex corner
-and never receives a convex-corner brace by fallback.
+carries the same `support_role= reentrant_opposite_strut`; coincident duplicate
+members are forbidden. No conversion web may start at the corner vertex. The
+concave vertex is never treated as a convex corner and never receives a
+convex-corner brace by fallback.
 
 ### Pillars and secondary links
 
@@ -63,6 +65,20 @@ Pillars are sparse and may be placed only at registered structural intersections
 
 The implementation must enforce these invariants before a layout is accepted:
 
+- Every edge-truss web endpoint is coincident with a chord, waling, support, or
+  another registered web node; a visible chord/web gap is an error.
+- Waling-axis and inner-chord opposite struts are generated before the edge-web
+  field; webs may meet them only at registered planarized nodes.
+- High-force corner transfer axes and inner chords are reserved before generic
+  opposite struts are placed, so generic spacing cannot create a near-parallel
+  duplicate beside the corner pair.
+- Inner chords carrying corner-transfer force use the same
+  `support_role=reentrant_opposite_strut` identifier as the corresponding
+  opposite struts.
+- Edge-web apex angles below 30 degrees are collapsed to direct node-to-node
+  eight-brace geometry; narrow V fans are forbidden.
+- No conversion or edge web may originate at a geometric corner vertex as a
+  radial ray.
 - Every original boundary segment has a continuous waling and edge-truss representation.
 - Every member endpoint resolves to a waling, chord, registered intersection, pillar, or ring node.
 - No main strut intersects the original excavation polygon boundary except at an explicitly registered endpoint.

@@ -21,6 +21,7 @@ Geometry = list[Point2D]
 
 SUPPORT_SYSTEMS = {"orthogonal", "brace", "opposite_strut", "straight_truss", "circular"}
 EDGE_TRUSS_MAX_APEX_ANGLE = 100.0
+EDGE_TRUSS_MIN_APEX_ANGLE = 30.0
 STATS_KEYS = (
     "main_strut_length",
     "corner_length",
@@ -615,19 +616,33 @@ class StrutEngine:
         }
         self._remove_layout_members(layout, replaced_main_strut_ids)
 
+        # High-force corner transfer axes and all inner chords are anchors for
+        # the web field.  They must exist before any web is generated.
+        for conversion in conversion_groups:
+            for extension in conversion["outer_extensions"]:
+                self._add_linear_member(
+                    layout,
+                    "main_strut",
+                    extension["geometry"],
+                    old_key="struts",
+                    node_kind="strut_end",
+                    attributes={
+                        "conversion_group": conversion["group_id"],
+                        "corner_class": "concave",
+                        "corner_role": "reentrant_outer_opposite_strut",
+                        "support_role": "reentrant_opposite_strut",
+                        "support_axis": extension["axis"],
+                        "conversion_corner": conversion["corner"],
+                        "conversion_shared": conversion["shared"],
+                    },
+                )
+
         for index, inner_geometry in enumerate(inner_lines):
             if len(inner_geometry) < 2:
                 continue
             outer_start = corners[index]
             outer_end = corners[(index + 1) % len(corners)]
             edge_id = f"edge_truss_{index + 1}"
-            edge = LineString([outer_start, outer_end])
-            inward = _polygon_inward_unit_normal(
-                outer_start,
-                outer_end,
-                waling_poly,
-                depth,
-            )
             adjacent_assemblies = [
                 f"corner_bracket_{index + 1}",
                 f"corner_bracket_{(index + 1) % len(corners) + 1}",
@@ -641,6 +656,17 @@ class StrutEngine:
                 chord_attributes.update({
                     "conversion_group": reentrant_inner_roles[index],
                     "corner_class": "concave",
+                    "support_role": "reentrant_opposite_strut",
+                    "conversion_corner": next(
+                        conversion["corner"]
+                        for conversion in conversion_groups
+                        if conversion["group_id"] == reentrant_inner_roles[index]
+                    ),
+                    "conversion_shared": next(
+                        conversion["shared"]
+                        for conversion in conversion_groups
+                        if conversion["group_id"] == reentrant_inner_roles[index]
+                    ),
                     "structural_roles": ["reentrant_opposite_strut"],
                 })
             self._add_linear_member(
@@ -652,6 +678,19 @@ class StrutEngine:
                 attributes=chord_attributes,
             )
 
+        for index, inner_geometry in enumerate(inner_lines):
+            if len(inner_geometry) < 2:
+                continue
+            outer_start = corners[index]
+            outer_end = corners[(index + 1) % len(corners)]
+            edge_id = f"edge_truss_{index + 1}"
+            edge = LineString([outer_start, outer_end])
+            inward = _polygon_inward_unit_normal(
+                outer_start,
+                outer_end,
+                waling_poly,
+                depth,
+            )
             corner_reach = min(requested_tiers * depth, edge.length / 2.0)
             stations = [corner_reach, edge.length - corner_reach]
             for member in layout["members"]:
@@ -663,6 +702,11 @@ class StrutEngine:
                         if corner_reach < distance < edge.length - corner_reach:
                             stations.append(distance)
             unique_stations = sorted({round(float(value), 6) for value in stations})
+            unique_stations = _filter_edge_truss_stations(
+                unique_stations,
+                edge.length,
+                depth,
+            )
             fixed_nodes = [
                 (
                     round(float(edge.interpolate(distance).x), 6),
@@ -703,36 +747,6 @@ class StrutEngine:
                         "truss_primitive": "panel",
                     },
                 )
-
-        for conversion in conversion_groups:
-            for extension in conversion["outer_extensions"]:
-                self._add_linear_member(
-                    layout,
-                    "main_strut",
-                    extension["geometry"],
-                    old_key="struts",
-                    node_kind="strut_end",
-                    attributes={
-                        "conversion_group": conversion["group_id"],
-                        "corner_class": "concave",
-                        "corner_role": "reentrant_outer_opposite_strut",
-                        "support_axis": extension["axis"],
-                    },
-                )
-            self._add_linear_member(
-                layout,
-                "truss_web",
-                [conversion["corner"], conversion["shared"]],
-                old_key=None,
-                node_kind="truss_node",
-                attributes={
-                    "conversion_group": conversion["group_id"],
-                    "corner_class": "concave",
-                    "edge_role": "conversion_web",
-                    "truss_primitive": "panel",
-                    "conversion_role": "secondary_cell_web",
-                },
-            )
 
         corner_models: list[dict[str, Any]] = []
         for index, corner in enumerate(corners):
@@ -2865,6 +2879,22 @@ class StrutEngine:
         nodes = layout["nodes"]
         if min_separation <= 0.0 or len(nodes) < 2:
             return
+        members_by_id = {
+            str(member["id"]): member for member in layout["members"]
+        }
+        snap_tol = float(self.params["node_snap_tolerance"])
+
+        def merge_preserves_member_geometry(left: dict[str, Any], right: dict[str, Any]) -> bool:
+            """Only merge nearby nodes when every incident member stays anchored."""
+            for node, other in ((left, right), (right, left)):
+                other_point = Point(other["pos"])
+                for member_id in node.get("source", []):
+                    member = members_by_id.get(str(member_id))
+                    if member is None:
+                        continue
+                    if LineString(member["geometry"]).distance(other_point) > snap_tol:
+                        return False
+            return True
 
         parent = list(range(len(nodes)))
 
@@ -2887,6 +2917,8 @@ class StrutEngine:
                 if "truss_node" not in left["kind"] and "truss_node" not in right["kind"]:
                     continue
                 if left_point.distance(Point(right["pos"])) < min_separation - 1e-9:
+                    if not merge_preserves_member_geometry(left, right):
+                        continue
                     union(left_index, right_index)
 
         clusters: dict[int, list[int]] = {}
@@ -3546,6 +3578,33 @@ def _unit_vector(start: Point2D, end: Point2D) -> Point2D:
 
 def _dominant_axis(start: Point2D, end: Point2D) -> str:
     return "horizontal" if abs(end[0] - start[0]) >= abs(end[1] - start[1]) else "vertical"
+
+
+def _filter_edge_truss_stations(
+    stations: list[float],
+    edge_length: float,
+    depth: float,
+) -> list[float]:
+    """Collapse close panel stations so V webs become direct node-to-node braces."""
+    if len(stations) < 2:
+        return stations
+    min_gap = 2.0 * depth * tan(EDGE_TRUSS_MIN_APEX_ANGLE * pi / 360.0)
+    if len(stations) == 2 and stations[1] - stations[0] < min_gap - 1e-6:
+        center = (stations[0] + stations[1]) / 2.0
+        half_gap = min_gap / 2.0
+        return [
+            max(0.0, center - half_gap),
+            min(edge_length, center + half_gap),
+        ]
+    selected = [stations[0]]
+    for station in stations[1:-1]:
+        if station - selected[-1] >= min_gap - 1e-6:
+            selected.append(station)
+    last = stations[-1]
+    if last - selected[-1] < min_gap - 1e-6 and len(selected) > 1:
+        selected.pop()
+    selected.append(min(edge_length, last))
+    return selected
 
 
 def _extended_line(start: Point2D, end: Point2D, extension: float) -> LineString:

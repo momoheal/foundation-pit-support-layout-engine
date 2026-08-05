@@ -1507,6 +1507,11 @@ def test_l_shape_reentrant_corner_uses_one_registered_conversion_group() -> None
 
     assert conversion_members
     assert all(member.get("corner_class") == "concave" for member in conversion_members)
+    assert not any(member["kind"] == "truss_web" for member in conversion_members)
+    assert all(
+        member.get("support_role") == "reentrant_opposite_strut"
+        for member in conversion_members
+    )
     assert all(
         all(any(Point(endpoint).distance(node) <= 1e-6 for node in nodes) for endpoint in member["geometry"])
         for member in conversion_members
@@ -1520,14 +1525,14 @@ def test_l_shape_reentrant_corner_uses_one_registered_conversion_group() -> None
 def test_l_shape_reentrant_corner_uses_two_paired_opposite_strut_axes() -> None:
     layout = _l_shape_layout()
     min_x, min_y, max_x, max_y = Polygon(layout["waling"]).bounds
-    conversion_web = next(
+    conversion_member = next(
         member
         for member in layout["members"]
         if member.get("conversion_group") == "reentrant_1"
-        and member.get("edge_role") == "conversion_web"
+        and member.get("support_role") == "reentrant_opposite_strut"
     )
-    corner = conversion_web["geometry"][0]
-    shared = conversion_web["geometry"][-1]
+    corner = conversion_member["conversion_corner"]
+    shared = conversion_member["conversion_shared"]
     outer_members = [
         member
         for member in layout["members"]
@@ -1547,6 +1552,10 @@ def test_l_shape_reentrant_corner_uses_two_paired_opposite_strut_axes() -> None:
         "horizontal",
         "vertical",
     }
+    assert all(
+        member.get("support_role") == "reentrant_opposite_strut"
+        for member in outer_members + inner_members
+    )
     assert outer.covers(LineString([(min_x, corner[1]), corner]))
     assert outer.covers(LineString([(corner[0], min_y), corner]))
     assert inner.covers(LineString([(min_x, shared[1]), (max_x, shared[1])]))
@@ -1561,6 +1570,57 @@ def test_l_shape_reentrant_corner_uses_two_paired_opposite_strut_axes() -> None:
         all(chord.intersection(main).length <= 1e-6 for main in main_struts)
         for chord in [_member_line(member) for member in inner_members]
     )
+
+
+def test_l_shape_edge_web_endpoints_have_no_chord_gap() -> None:
+    layout = _l_shape_layout()
+    waling = LineString(layout["waling"])
+    chords = [member for member in layout["members"] if member["kind"] == "truss_chord"]
+    webs = [
+        member for member in layout["members"]
+        if member["kind"] == "truss_web" and member.get("edge_role") == "web"
+    ]
+    for web in webs:
+        for endpoint in (web["geometry"][0], web["geometry"][-1]):
+            assert min(
+                [LineString(member["geometry"]).distance(Point(endpoint)) for member in chords]
+                + [waling.distance(Point(endpoint))]
+                + [
+                    _member_line(member).distance(Point(endpoint))
+                    for member in layout["members"]
+                    if member["id"] != web["id"]
+                ]
+            ) <= 1e-6, (web["id"], endpoint)
+
+
+def test_l_shape_edge_webs_do_not_cross_corner_supports_away_from_nodes() -> None:
+    layout = _l_shape_layout()
+    support_lines = [
+        _member_line(member)
+        for member in layout["members"]
+        if member.get("support_role") == "reentrant_opposite_strut"
+    ]
+    webs = [
+        member for member in layout["members"]
+        if member["kind"] == "truss_web" and member.get("edge_role") == "web"
+    ]
+    for web in webs:
+        line = _member_line(web)
+        for support in support_lines:
+            intersection = line.intersection(support)
+            if intersection.is_empty:
+                continue
+            assert any(
+                Point(point).distance(Point(endpoint)) <= 1e-6
+                for point in ([intersection.coords[0]] if intersection.geom_type == "Point" else [])
+                for endpoint in (web["geometry"][0], web["geometry"][-1])
+            ), (web["id"], intersection.wkt)
+
+
+def test_l_shape_edge_web_apexes_use_direct_eight_brace_nodes() -> None:
+    angles = _edge_truss_v_apex_angles(_l_shape_layout())
+    assert angles
+    assert min(angles) >= 30.0 - 1e-4
 
 
 def test_l_shape_pillars_only_use_final_non_collinear_main_strut_crossings() -> None:
