@@ -693,25 +693,19 @@ class StrutEngine:
             )
             corner_reach = min(requested_tiers * depth, edge.length / 2.0)
             stations = [corner_reach, edge.length - corner_reach]
-            protected_stations: list[float] = []
             for member in layout["members"]:
-                if (
-                    member["kind"] != "main_strut"
-                    or member.get("support_role") == "reentrant_opposite_strut"
-                ):
+                if member["kind"] != "main_strut":
                     continue
                 for point in (member["geometry"][0], member["geometry"][-1]):
                     if edge.distance(Point(point)) <= 1e-6:
                         distance = edge.project(Point(point))
                         if corner_reach < distance < edge.length - corner_reach:
                             stations.append(distance)
-                            protected_stations.append(distance)
             unique_stations = sorted({round(float(value), 6) for value in stations})
             unique_stations = _filter_edge_truss_stations(
                 unique_stations,
                 edge.length,
                 depth,
-                protected=protected_stations,
             )
             fixed_nodes = [
                 (
@@ -720,58 +714,14 @@ class StrutEngine:
                 )
                 for distance in unique_stations
             ]
-            preserve_support_nodes = self.poly.convex_hull.area - self.poly.area > max(self.poly.area * 0.02, 1e-6)
-            outer_nodes = self._subdivide_edge_truss_panels(
-                fixed_nodes,
-                panel_max,
-                preserve_nodes=preserve_support_nodes,
-            )
+            outer_nodes = self._subdivide_edge_truss_panels(fixed_nodes, panel_max)
             inner_nodes = [_offset_point(point, inward, depth) for point in outer_nodes]
-            protected_distances = sorted({round(float(value), 6) for value in protected_stations})
-            if preserve_support_nodes:
-                for distance in protected_distances:
-                    outer_point = edge.interpolate(distance)
-                    outer_anchor = (round(float(outer_point.x), 6), round(float(outer_point.y), 6))
-                    inner_anchor = _offset_point(outer_anchor, inward, depth)
-                    direct_brace = [outer_anchor, inner_anchor]
-                    covering_main = next((
-                        member for member in layout["members"]
-                        if member["kind"] == "main_strut"
-                        and LineString(member["geometry"]).buffer(1e-6).covers(LineString(direct_brace))
-                    ), None)
-                    if covering_main is not None:
-                        roles = set(covering_main.get("structural_roles", []))
-                        roles.add("edge_truss_web")
-                        covering_main["structural_roles"] = sorted(roles)
-                        covering_main.setdefault("edge_truss_web_segments", []).append(direct_brace)
-                        covering_main.setdefault("edge_truss_ids", []).append(edge_id)
-                    else:
-                        self._add_linear_member(
-                            layout,
-                            "truss_web",
-                            direct_brace,
-                            old_key=None,
-                            node_kind="truss_node",
-                            attributes={
-                                "edge_truss_id": edge_id,
-                                "edge_role": "web",
-                                "truss_primitive": "eight_brace",
-                                "protected_support_station": distance,
-                            },
-                        )
             for panel_index, (outer_a, outer_b, inner_a, inner_b) in enumerate(zip(
                 outer_nodes,
                 outer_nodes[1:],
                 inner_nodes,
                 inner_nodes[1:],
             )):
-                panel_start = edge.project(Point(outer_a))
-                panel_end = edge.project(Point(outer_b))
-                if preserve_support_nodes and any(
-                    panel_start - 1e-6 <= distance <= panel_end + 1e-6
-                    for distance in protected_distances
-                ):
-                    continue
                 web = [outer_a, inner_b] if panel_index % 2 == 0 else [inner_a, outer_b]
                 covering_main = next((
                     member for member in layout["members"]
@@ -1424,8 +1374,6 @@ class StrutEngine:
         self,
         nodes: list[Point2D],
         max_panel: float,
-        *,
-        preserve_nodes: bool = False,
     ) -> list[Point2D]:
         if len(nodes) < 2:
             return nodes
@@ -1433,7 +1381,7 @@ class StrutEngine:
         for start, end in zip(nodes, nodes[1:]):
             line = LineString([start, end])
             steps = max(1, int(ceil(line.length / max(max_panel, 1e-6))))
-            if not preserve_nodes and steps % 2 != 0:
+            if steps % 2 != 0:
                 steps += 1
             subdivided.extend([
                 (
@@ -3636,21 +3584,12 @@ def _filter_edge_truss_stations(
     stations: list[float],
     edge_length: float,
     depth: float,
-    *,
-    protected: list[float] | None = None,
 ) -> list[float]:
     """Collapse close panel stations so V webs become direct node-to-node braces."""
     if len(stations) < 2:
         return stations
     min_gap = 2.0 * depth * tan(EDGE_TRUSS_MIN_APEX_ANGLE * pi / 360.0)
-    protected_set = {round(float(value), 6) for value in (protected or [])}
-
-    def is_protected(value: float) -> bool:
-        return round(float(value), 6) in protected_set
-
     if len(stations) == 2 and stations[1] - stations[0] < min_gap - 1e-6:
-        if any(is_protected(value) for value in stations):
-            return stations
         center = (stations[0] + stations[1]) / 2.0
         half_gap = min_gap / 2.0
         return [
@@ -3661,17 +3600,9 @@ def _filter_edge_truss_stations(
     for station in stations[1:-1]:
         if station - selected[-1] >= min_gap - 1e-6:
             selected.append(station)
-        elif is_protected(station) and not is_protected(selected[-1]):
-            selected[-1] = station
-        elif is_protected(station) and is_protected(selected[-1]):
-            selected.append(station)
     last = stations[-1]
     if last - selected[-1] < min_gap - 1e-6 and len(selected) > 1:
-        if is_protected(last) or is_protected(selected[-1]):
-            if not is_protected(last) and not is_protected(selected[-1]):
-                selected.pop()
-        else:
-            selected.pop()
+        selected.pop()
     selected.append(min(edge_length, last))
     return selected
 

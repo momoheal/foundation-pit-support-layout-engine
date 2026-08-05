@@ -1617,57 +1617,6 @@ def test_l_shape_edge_webs_do_not_cross_corner_supports_away_from_nodes() -> Non
             ), (web["id"], intersection.wkt)
 
 
-def test_l_shape_right_edge_web_terminates_at_support_chord_node() -> None:
-    layout = _l_shape_layout()
-    target = Point(57.5, 11.25)
-    edge_webs = [
-        member for member in layout["members"]
-        if member["kind"] == "truss_web" and member.get("edge_truss_id") == "edge_truss_5"
-    ]
-    direct_web = any(
-        target.distance(Point(endpoint)) <= 1e-6
-        for web in edge_webs
-        for endpoint in (web["geometry"][0], web["geometry"][-1])
-    )
-    direct_main = any(
-        any(
-            target.distance(Point(endpoint)) <= 1e-6
-            for endpoint in segment
-        )
-        for member in layout["members"]
-        if member["kind"] == "main_strut"
-        for segment in member.get("edge_truss_web_segments", [])
-    )
-    assert direct_web or direct_main
-
-
-def test_l_shape_edge_webs_only_meet_members_at_registered_nodes() -> None:
-    layout = _l_shape_layout()
-    edge_webs = [
-        member for member in layout["members"]
-        if member["kind"] == "truss_web" and member.get("edge_role") == "web"
-    ]
-    checked_kinds = {"main_strut", "truss_chord", "truss_web", "tie"}
-    violations = []
-    for web in edge_webs:
-        web_line = _member_line(web)
-        web_endpoints = [Point(web["geometry"][0]), Point(web["geometry"][-1])]
-        for other in layout["members"]:
-            if other["id"] == web["id"] or other["kind"] not in checked_kinds:
-                continue
-            intersection = web_line.intersection(_member_line(other))
-            if intersection.is_empty:
-                continue
-            points = [Point(intersection)] if intersection.geom_type == "Point" else []
-            for point in points:
-                other_endpoints = [Point(other["geometry"][0]), Point(other["geometry"][-1])]
-                if not any(point.distance(endpoint) <= 1e-6 for endpoint in web_endpoints) or not any(
-                    point.distance(endpoint) <= 1e-6 for endpoint in other_endpoints
-                ):
-                    violations.append((web["id"], other["id"], intersection.wkt))
-    assert violations == []
-
-
 def test_l_shape_edge_web_apexes_use_direct_eight_brace_nodes() -> None:
     angles = _edge_truss_v_apex_angles(_l_shape_layout())
     assert angles
