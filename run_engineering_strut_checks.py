@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from shapely.geometry import LineString, Point, Polygon
+from shapely.ops import unary_union
 
 from main_strut import export_strut_dxf
 from strut_diagnostics import export_strut_diagnostic_png
@@ -214,6 +215,21 @@ def _check_l_shape_support(case: Case, layout: dict[str, Any]) -> int:
         if member["kind"] == "truss_chord" and member.get("edge_role") == "inner_chord"
     }
     waling = [member for member in layout["members"] if member["kind"] == "waling"]
+    conversion_web = next((
+        member
+        for member in conversion
+        if member.get("edge_role") == "conversion_web"
+    ), None)
+    outer_transfer = [
+        member
+        for member in conversion
+        if member.get("corner_role") == "reentrant_outer_opposite_strut"
+    ]
+    inner_transfer = [
+        member
+        for member in conversion
+        if "reentrant_opposite_strut" in member.get("structural_roles", [])
+    ]
     failures = _check(bool(main), "L-shaped pit has visible opposite struts")
     failures += _check(
         all(LineString(member["geometry"]).intersection(excavation_boundary).length <= 1e-6 for member in main),
@@ -232,6 +248,30 @@ def _check_l_shape_support(case: Case, layout: dict[str, Any]) -> int:
         all(member.get("corner_class") == "concave" for member in conversion),
         "L-shaped conversion members are concave-only",
     )
+    if conversion_web is not None:
+        corner = conversion_web["geometry"][0]
+        shared = conversion_web["geometry"][-1]
+        min_x, min_y, max_x, max_y = Polygon(layout["waling"]).bounds
+        outer_geometry = unary_union([
+            LineString(member["geometry"]) for member in outer_transfer
+        ]).buffer(1e-6)
+        inner_geometry = unary_union([
+            LineString(member["geometry"]) for member in inner_transfer
+        ]).buffer(1e-6)
+        failures += _check(
+            {member.get("support_axis") for member in outer_transfer}
+            == {"horizontal", "vertical"}
+            and outer_geometry.covers(LineString([(min_x, corner[1]), corner]))
+            and outer_geometry.covers(LineString([(corner[0], min_y), corner])),
+            "L-shaped high-force corner has two waling-axis opposite struts",
+        )
+        failures += _check(
+            inner_geometry.covers(LineString([(min_x, shared[1]), (max_x, shared[1])]))
+            and inner_geometry.covers(LineString([(shared[0], min_y), (shared[0], max_y)])),
+            "L-shaped inner chords continue as paired opposite struts",
+        )
+    else:
+        failures += _check(False, "L-shaped high-force corner has a conversion web")
     failures += _check(
         bool(waling)
         and all("edge_truss_outer_chord" in member.get("structural_roles", []) for member in waling),

@@ -1517,6 +1517,52 @@ def test_l_shape_reentrant_corner_uses_one_registered_conversion_group() -> None
     )
 
 
+def test_l_shape_reentrant_corner_uses_two_paired_opposite_strut_axes() -> None:
+    layout = _l_shape_layout()
+    min_x, min_y, max_x, max_y = Polygon(layout["waling"]).bounds
+    conversion_web = next(
+        member
+        for member in layout["members"]
+        if member.get("conversion_group") == "reentrant_1"
+        and member.get("edge_role") == "conversion_web"
+    )
+    corner = conversion_web["geometry"][0]
+    shared = conversion_web["geometry"][-1]
+    outer_members = [
+        member
+        for member in layout["members"]
+        if member.get("conversion_group") == "reentrant_1"
+        and member.get("corner_role") == "reentrant_outer_opposite_strut"
+    ]
+    inner_members = [
+        member
+        for member in layout["members"]
+        if member.get("conversion_group") == "reentrant_1"
+        and "reentrant_opposite_strut" in member.get("structural_roles", [])
+    ]
+
+    outer = unary_union([_member_line(member) for member in outer_members]).buffer(1e-6)
+    inner = unary_union([_member_line(member) for member in inner_members]).buffer(1e-6)
+    assert {member.get("support_axis") for member in outer_members} == {
+        "horizontal",
+        "vertical",
+    }
+    assert outer.covers(LineString([(min_x, corner[1]), corner]))
+    assert outer.covers(LineString([(corner[0], min_y), corner]))
+    assert inner.covers(LineString([(min_x, shared[1]), (max_x, shared[1])]))
+    assert inner.covers(LineString([(shared[0], min_y), (shared[0], max_y)]))
+
+    main_struts = [
+        _member_line(member)
+        for member in layout["members"]
+        if member["kind"] == "main_strut"
+    ]
+    assert all(
+        all(chord.intersection(main).length <= 1e-6 for main in main_struts)
+        for chord in [_member_line(member) for member in inner_members]
+    )
+
+
 def test_l_shape_pillars_only_use_final_non_collinear_main_strut_crossings() -> None:
     layout = _l_shape_layout()
     main_struts = [

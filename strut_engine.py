@@ -587,6 +587,11 @@ class StrutEngine:
             corners,
             inner_lines,
         )
+        reentrant_inner_roles = {
+            edge_index: conversion["group_id"]
+            for conversion in conversion_groups
+            for edge_index in conversion["inner_edge_indexes"]
+        }
 
         replaced_main_strut_ids = {
             str(member["id"])
@@ -617,22 +622,34 @@ class StrutEngine:
             outer_end = corners[(index + 1) % len(corners)]
             edge_id = f"edge_truss_{index + 1}"
             edge = LineString([outer_start, outer_end])
-            inward = _unit_vector(outer_start, inner_geometry[0])
+            inward = _polygon_inward_unit_normal(
+                outer_start,
+                outer_end,
+                waling_poly,
+                depth,
+            )
             adjacent_assemblies = [
                 f"corner_bracket_{index + 1}",
                 f"corner_bracket_{(index + 1) % len(corners) + 1}",
             ]
+            chord_attributes = {
+                "edge_truss_id": edge_id,
+                "edge_role": "inner_chord",
+                "corner_assemblies": adjacent_assemblies,
+            }
+            if index in reentrant_inner_roles:
+                chord_attributes.update({
+                    "conversion_group": reentrant_inner_roles[index],
+                    "corner_class": "concave",
+                    "structural_roles": ["reentrant_opposite_strut"],
+                })
             self._add_linear_member(
                 layout,
                 "truss_chord",
                 inner_geometry,
                 old_key=None,
                 node_kind="truss_node",
-                attributes={
-                    "edge_truss_id": edge_id,
-                    "edge_role": "inner_chord",
-                    "corner_assemblies": adjacent_assemblies,
-                },
+                attributes=chord_attributes,
             )
 
             corner_reach = min(requested_tiers * depth, edge.length / 2.0)
@@ -688,6 +705,20 @@ class StrutEngine:
                 )
 
         for conversion in conversion_groups:
+            for extension in conversion["outer_extensions"]:
+                self._add_linear_member(
+                    layout,
+                    "main_strut",
+                    extension["geometry"],
+                    old_key="struts",
+                    node_kind="strut_end",
+                    attributes={
+                        "conversion_group": conversion["group_id"],
+                        "corner_class": "concave",
+                        "corner_role": "reentrant_outer_opposite_strut",
+                        "support_axis": extension["axis"],
+                    },
+                )
             self._add_linear_member(
                 layout,
                 "truss_web",
@@ -699,6 +730,7 @@ class StrutEngine:
                     "corner_class": "concave",
                     "edge_role": "conversion_web",
                     "truss_primitive": "panel",
+                    "conversion_role": "secondary_cell_web",
                 },
             )
 
@@ -766,13 +798,51 @@ class StrutEngine:
             diagonal = LineString([corner, shared])
             if not waling_poly.buffer(1e-6).covers(diagonal):
                 continue
-            previous_inner[-1] = shared
-            following_inner[0] = shared
+            previous_inner_opposite = self._ray_hit_boundary(
+                shared,
+                _unit_vector(previous_inner[0], shared),
+                waling_poly,
+            )
+            following_inner_opposite = self._ray_hit_boundary(
+                shared,
+                _unit_vector(following_inner[-1], shared),
+                waling_poly,
+            )
+            previous_outer_opposite = self._ray_hit_boundary(
+                corner,
+                _unit_vector(prev_pt, corner),
+                waling_poly,
+            )
+            following_outer_opposite = self._ray_hit_boundary(
+                corner,
+                _unit_vector(next_pt, corner),
+                waling_poly,
+            )
+            if not all((
+                previous_inner_opposite,
+                following_inner_opposite,
+                previous_outer_opposite,
+                following_outer_opposite,
+            )):
+                continue
+            previous_inner[-1] = previous_inner_opposite
+            following_inner[0] = following_inner_opposite
             group_index += 1
             groups.append({
                 "group_id": f"reentrant_{group_index}",
                 "corner": corner,
                 "shared": shared,
+                "inner_edge_indexes": (index - 1, index),
+                "outer_extensions": [
+                    {
+                        "axis": _dominant_axis(corner, previous_outer_opposite),
+                        "geometry": [corner, previous_outer_opposite],
+                    },
+                    {
+                        "axis": _dominant_axis(corner, following_outer_opposite),
+                        "geometry": [corner, following_outer_opposite],
+                    },
+                ],
             })
         return groups
 
@@ -3472,6 +3542,10 @@ def _unit_vector(start: Point2D, end: Point2D) -> Point2D:
     if length <= 1e-9:
         return (0.0, 0.0)
     return (dx / length, dy / length)
+
+
+def _dominant_axis(start: Point2D, end: Point2D) -> str:
+    return "horizontal" if abs(end[0] - start[0]) >= abs(end[1] - start[1]) else "vertical"
 
 
 def _extended_line(start: Point2D, end: Point2D, extension: float) -> LineString:

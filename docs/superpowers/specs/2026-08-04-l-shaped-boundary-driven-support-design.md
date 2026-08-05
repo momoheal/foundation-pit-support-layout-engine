@@ -32,9 +32,28 @@ The L shape is partitioned into two support zones at the re-entrant corner:
 
 For each boundary segment, cast a normal into the excavation and connect it to the first visible opposite waling in the same support zone. A candidate is rejected when it overlaps the excavation boundary, runs longitudinally along a boundary segment, or crosses the notch. Horizontal and vertical arms therefore form separate strut groups.
 
-### Re-entrant conversion-node group
+### Re-entrant high-force corner transfer
 
-The conversion group is the only interface between the two zones. It consists of existing waling nodes, edge-truss chord nodes, and their intersections. A conversion diagonal is allowed only when both endpoints are registered structural nodes and the diagonal forms a non-degenerate triangle with the adjacent chord/waling members. The concave vertex is never treated as a convex corner and never receives a convex-corner brace by fallback.
+The geometrically concave L vertex is an engineering high-force corner. It is
+not handled as a single diagonal conversion between two perimeter trusses.
+The two adjacent edge-truss systems must participate in paired opposite-strut
+load paths:
+
+- extend each adjacent waling axis from the corner toward the opposing waling;
+  these are the two outer, corner-directed opposite struts;
+- extend each adjacent inner-chord axis collinearly through the corner zone to
+  the opposing waling; the inner chord is one of the paired opposite struts,
+  not a separate short link;
+- register the crossings of the two axes and the inner-chord common node, so
+  the corner transfer is a compact two-direction structural cell;
+- retain at most one explicit conversion web across that cell, only between
+  registered nodes and never as the sole load path.
+
+The outer extension is a `main_strut` continuation of the waling axis. The
+inner extension remains the physical `truss_chord` member and additionally
+carries the structural role `reentrant_opposite_strut`; coincident duplicate
+members are forbidden. The concave vertex is never treated as a convex corner
+and never receives a convex-corner brace by fallback.
 
 ### Pillars and secondary links
 
@@ -50,6 +69,10 @@ The implementation must enforce these invariants before a layout is accepted:
 - No main strut crosses the re-entrant notch or runs along an excavation edge.
 - The outer chord and waling are coincident within node tolerance.
 - The inner chord continuation reaches a waling node and is classified as part of the corner-brace path.
+- At every high-force L vertex, two orthogonal paired opposite-strut axes are
+  present: one waling-axis pair and one inner-chord pair.
+- Each inner-chord pair member reaches the opposing waling without a dangling
+  endpoint or a short near-parallel duplicate.
 - The concave vertex has no convex-corner brace.
 - Duplicate, coincident, and near-parallel members are rejected where an existing triangular load path already exists.
 
