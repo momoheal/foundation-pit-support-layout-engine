@@ -18,6 +18,12 @@ MEMBER_STYLES = {
 }
 
 
+def _member_style(member: dict[str, Any]) -> dict[str, Any]:
+    if member.get("kind") == "truss_chord" and member.get("support_role") == "reentrant_opposite_strut":
+        return MEMBER_STYLES["main_strut"]
+    return MEMBER_STYLES.get(member.get("kind"), {"color": "#334155", "linewidth": 0.8, "zorder": 1})
+
+
 def _main_truss_connection_points(layout: dict[str, Any]) -> list[tuple[float, float]]:
     kind_by_member_id = {
         member["id"]: member["kind"]
@@ -72,7 +78,7 @@ def export_strut_diagnostic_png(
         geometry = member.get("geometry", [])
         if len(geometry) < 2:
             continue
-        style = MEMBER_STYLES.get(member.get("kind"), {"color": "#334155", "linewidth": 0.8, "zorder": 1})
+        style = _member_style(member)
         ax.plot(
             [point[0] for point in geometry],
             [point[1] for point in geometry],

@@ -1,5 +1,5 @@
 [tool.pytest.ini_options]
-testpaths = ["test_strut_minimal.py", "test_structural_red_lines.py", "test_issue_management.py"]
+testpaths = ["test_strut_minimal.py", "test_structural_red_lines.py", "test_issue_management.py", "test_l_shape_joint_contract.py"]
 cache_dir = ".pytest_cache"
 
 [tool.mypy]

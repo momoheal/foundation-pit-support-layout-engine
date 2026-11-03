@@ -636,6 +636,53 @@ def validate_conversion_endpoints(layout: dict[str, Any]) -> list[ValidationIssu
     return issues
 
 
+def validate_concave_web_rods(layout: dict[str, Any]) -> list[ValidationIssue]:
+    """Do not accept a through-crossing merely because planarization split it."""
+    if not layout.get("waling"):
+        return []
+    polygon = Polygon(layout["waling"])
+    if polygon.convex_hull.area - polygon.area <= max(polygon.area * 0.02, 1e-6):
+        return []
+    coords = list(polygon.exterior.coords)
+    if len(coords) != 7 or not all(abs(a[0] - b[0]) < 1e-6 or abs(a[1] - b[1]) < 1e-6
+               for a, b in zip(coords, coords[1:])):
+        return []
+    logical = {}
+    for m in layout.get("members", []):
+        logical.setdefault(m.get("parent_member_id", m["id"]), m)
+    rods = [(m, LineString(m.get("logical_geometry", m["geometry"]))) for m in logical.values()]
+    issues = []
+    for web, line in rods:
+        if web.get("edge_role") != "web" or web.get("system") != "brace":
+            continue
+        endpoints = [Point(line.coords[0]), Point(line.coords[-1])]
+        if sum(polygon.boundary.distance(p) <= 1e-5 for p in endpoints) != 1:
+            issues.append(ValidationIssue("truss_web", web["id"], None, None,
+                                          "web_not_waling_to_inner_chord"))
+        inner_points = [p for p in endpoints if polygon.boundary.distance(p) > 1e-5]
+        chords = [other_line for other, other_line in rods
+                  if other["kind"] == "truss_chord" and other.get("edge_role") == "inner_chord"
+                  and other.get("edge_truss_id") == web.get("edge_truss_id")]
+        if len(inner_points) != 1 or not any(chord.distance(inner_points[0]) <= 1e-5 for chord in chords):
+            issues.append(ValidationIssue("truss_web", web["id"], None, None,
+                                          "web_disconnected_from_inner_chord"))
+        for other, other_line in rods:
+            if other["id"] == web["id"] or other["kind"] not in {"main_strut", "truss_web", "truss_chord"}:
+                continue
+            joint = line.intersection(other_line)
+            if joint.is_empty:
+                continue
+            if joint.geom_type != "Point" or min(joint.distance(p) for p in endpoints) > 1e-5:
+                issues.append(ValidationIssue("truss_web", web["id"], other["id"], None,
+                                              "logical_web_crosses_member"))
+            elif other["kind"] == "truss_web" and min(
+                joint.distance(Point(p)) for p in (other_line.coords[0], other_line.coords[-1])
+            ) > 1e-5:
+                issues.append(ValidationIssue("truss_web", web["id"], other["id"], None,
+                                              "logical_web_crosses_web"))
+    return issues
+
+
 def validate_layout(layout: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
     issues = []
     issues.extend(validate_member_bounds(layout, params))
@@ -650,6 +697,7 @@ def validate_layout(layout: dict[str, Any], params: dict[str, Any] | None = None
     issues.extend(validate_connection_spacing(layout, params))
     issues.extend(validate_perimeter_truss_continuity(layout, params))
     issues.extend(validate_edge_truss_corner_topology(layout, params))
+    issues.extend(validate_concave_web_rods(layout))
 
     issue_dicts = [asdict(issue) for issue in issues]
     return {

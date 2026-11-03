@@ -274,7 +274,10 @@ class StrutEngine:
         uses_perimeter_truss = self._uses_boundary_driven_perimeter_truss(waling_poly)
         uses_large_corner_truss = self._uses_large_corner_truss(waling_poly)
         if uses_perimeter_truss:
-            if uses_large_corner_truss:
+            node_driven = self._uses_orthogonal_concave_pairs(waling_poly)
+            if node_driven:
+                struts = []  # reserve transfer axes and chords before ordinary pairs
+            elif uses_large_corner_truss:
                 struts = self._place_main_struts_avoiding_corner_coverage(layout, waling_poly)
             else:
                 struts = self._place_main_struts(
@@ -288,6 +291,8 @@ class StrutEngine:
                 waling_poly,
                 preserve_main_struts=not uses_large_corner_truss,
             )
+            if node_driven:
+                struts = corner_model["paired_struts"]
             self._place_modular_corner_assemblies(layout, waling_poly, corner_model)
             self._place_perimeter_truss_stiffening(layout, waling_poly)
             self._place_truss_coupling_ties(layout, struts, waling_poly)
@@ -568,6 +573,7 @@ class StrutEngine:
             int(self.params["corner_truss_tier_count"]),
             2 if preserve_main_struts else int(self.params["corner_truss_tier_count"]),
         )
+        node_driven = self._uses_orthogonal_concave_pairs(waling_poly)
         inner_lines: list[Geometry] = []
 
         for index, outer_start in enumerate(corners):
@@ -678,6 +684,14 @@ class StrutEngine:
                 attributes=chord_attributes,
             )
 
+        paired_struts = (
+            self._place_boundary_zone_pairs(layout, waling_poly, depth, requested_tiers)
+            if node_driven else []
+        )
+        corner_tiers = (
+            self._limit_crowded_corner_tiers(waling_poly, corners, paired_struts, depth, requested_tiers)
+            if node_driven else {}
+        )
         for index, inner_geometry in enumerate(inner_lines):
             if len(inner_geometry) < 2:
                 continue
@@ -692,6 +706,16 @@ class StrutEngine:
                 depth,
             )
             corner_reach = min(requested_tiers * depth, edge.length / 2.0)
+            if node_driven:
+                start_reach = min(corner_tiers.get(index, requested_tiers) * depth, edge.length / 2.0)
+                end_reach = min(
+                    corner_tiers.get((index + 1) % len(corners), requested_tiers) * depth,
+                    edge.length / 2.0,
+                )
+                self._place_node_driven_edge_webs(
+                    layout, edge, inner_geometry, inward, depth, start_reach, end_reach, edge_id,
+                )
+                continue
             stations = [corner_reach, edge.length - corner_reach]
             for member in layout["members"]:
                 if member["kind"] != "main_strut":
@@ -771,6 +795,7 @@ class StrutEngine:
                 "prev_inner": prev_inner,
                 "next_inner": next_inner,
                 "inner_common": (float(intersection.x), float(intersection.y)),
+                "tier_limit": corner_tiers.get(index, requested_tiers),
             })
         return {
             "corners": corner_models,
@@ -778,7 +803,131 @@ class StrutEngine:
             "depth": depth,
             "tier_limit": requested_tiers,
             "replaced_main_strut_ids": sorted(replaced_main_strut_ids),
+            "paired_struts": paired_struts,
         }
+
+    def _uses_orthogonal_concave_pairs(self, polygon: Polygon) -> bool:
+        coords = list(polygon.exterior.coords)
+        return (
+            self.params["support_system"] == "brace"
+            and len(coords) == 7
+            and polygon.convex_hull.area - polygon.area > max(polygon.area * 0.02, 1e-6)
+            and all(abs(a[0] - b[0]) < 1e-6 or abs(a[1] - b[1]) < 1e-6
+                    for a, b in zip(coords, coords[1:]))
+        )
+
+    def _place_boundary_zone_pairs(
+        self, layout: dict[str, Any], polygon: Polygon, depth: float, tiers: int,
+    ) -> list[dict[str, Any]]:
+        """One complete pair per visible boundary interval, after reserved axes."""
+        bounds = polygon.bounds
+        corners = list(polygon.exterior.coords)[:-1]
+        reserved = [LineString(m["geometry"]) for m in layout["members"]
+                    if m["kind"] in {"main_strut", "truss_chord"}]
+        result: list[dict[str, Any]] = []
+        for axis in (0, 1):
+            breaks = sorted({p[axis] for p in corners})
+            for zone, (lo, hi) in enumerate(zip(breaks, breaks[1:])):
+                # A pair is indivisible. Small fields are served by corner/transfer supports.
+                free_lo, free_hi = lo + tiers * depth, hi - tiers * depth
+                if free_hi - free_lo < depth - 1e-6:
+                    continue
+                center = (free_lo + free_hi) / 2.0
+                positions = [center - depth / 2.0, center + depth / 2.0]
+                candidates = []
+                for position in positions:
+                    probe = (LineString([(position, bounds[1] - 1), (position, bounds[3] + 1)])
+                             if axis == 0 else
+                             LineString([(bounds[0] - 1, position), (bounds[2] + 1, position)]))
+                    spans = self._visible_support_segments(polygon, probe)
+                    if len(spans) != 1:
+                        break
+                    span = spans[0]
+                    if polygon.boundary.intersection(span).length > 1e-6:
+                        break
+                    if any(_segments_nearly_parallel(list(span.coords), list(other.coords))
+                           and span.distance(other) < depth - 1e-6 for other in reserved):
+                        break
+                    candidates.append(span)
+                if len(candidates) != 2:
+                    continue
+                for span in candidates:
+                    member = self._add_linear_member(
+                        layout, "main_strut", list(span.coords), old_key="struts",
+                        node_kind="strut_end", attributes={
+                            "opposite_pair_id": f"zone_{axis}_{zone}",
+                            "support_role": "ordinary_opposite_strut",
+                        },
+                    )
+                    if member is not None:
+                        result.append({"member": member, "axis": "x" if axis == 0 else "y"})
+                reserved.extend(candidates)
+        return result
+
+    def _limit_crowded_corner_tiers(
+        self, polygon: Polygon, corners: Geometry, struts: list[dict[str, Any]],
+        depth: float, requested: int,
+    ) -> dict[int, int]:
+        """Use one tier where the second tier would crowd a paired-strut joint."""
+        limits: dict[int, int] = {}
+        for index, corner in enumerate(corners):
+            prev_pt, next_pt = corners[index - 1], corners[(index + 1) % len(corners)]
+            if not _is_convex_corner(prev_pt, corner, next_pt, polygon):
+                continue
+            edges = [LineString([corner, prev_pt]), LineString([corner, next_pt])]
+            crowded = any(
+                edge.distance(Point(endpoint)) <= 1e-6
+                and requested * depth - 1e-6 <= Point(corner).distance(Point(endpoint))
+                < requested * depth + depth / 2.0 - 1e-6
+                for item in struts
+                for endpoint in (item["member"]["geometry"][0], item["member"]["geometry"][-1])
+                for edge in edges
+            )
+            limits[index] = 1 if crowded and requested > 1 else requested
+        return limits
+
+    def _place_node_driven_edge_webs(
+        self, layout: dict[str, Any], edge: LineString, inner_geometry: Geometry,
+        inward: Point2D, depth: float, start_reach: float, end_reach: float, edge_id: str,
+    ) -> None:
+        """Triangulate between fixed support/chord joints without crossing a support."""
+        lo, hi = start_reach, edge.length - end_reach
+        if hi - lo <= 1e-6:
+            return
+        chord = LineString(inner_geometry)
+        # Side 0 is waling, side 1 inner chord. Support nodes must be inner tips.
+        anchors = [(lo, 0), (hi, 0)]
+        for member in layout["members"]:
+            if member["kind"] != "main_strut" and member.get("support_role") != "reentrant_opposite_strut":
+                continue
+            joint = chord.intersection(LineString(member["geometry"]))
+            if isinstance(joint, Point):
+                station = float(edge.project(joint))
+                if lo + 1e-6 < station < hi - 1e-6:
+                    anchors.append((station, 1))
+        anchors = sorted(set(anchors))
+        min_v_span = 2.0 * depth * tan(EDGE_TRUSS_MIN_APEX_ANGLE * pi / 360.0)
+        # A short residual field uses one diagonal, never a narrow artificial V.
+        if len(anchors) == 2 and hi - lo < min_v_span:
+            anchors[-1] = (hi, 1)
+        panel_limit = self._edge_truss_panel_limit(depth)
+        points: list[Point2D] = []
+        for (start, side), (end, end_side) in zip(anchors, anchors[1:]):
+            steps = max(1, int(ceil((end - start) / panel_limit)))
+            if steps % 2 != (side != end_side):
+                steps += 1
+            for i in range(steps + 1):
+                station = start + (end - start) * i / steps
+                outer = edge.interpolate(station)
+                point = _offset_point((outer.x, outer.y), inward, depth if (side + i) % 2 else 0.0)
+                if not points or not _points_close(points[-1], point, tol=1e-6):
+                    points.append(point)
+        for a, b in zip(points, points[1:]):
+            self._add_linear_member(
+                layout, "truss_web", [a, b], old_key=None, node_kind="truss_node",
+                attributes={"edge_truss_id": edge_id, "edge_role": "web",
+                            "truss_primitive": "node_anchored_panel"},
+            )
 
     def _connect_reentrant_inner_chords(
         self,
@@ -878,7 +1027,7 @@ class StrutEngine:
 
         for corner in corner_model.get("corners", []):
             legal_count = int(min(corner["prev_length"], corner["next_length"]) // spacing)
-            tier_count = min(requested, legal_count)
+            tier_count = min(requested, legal_count, int(corner.get("tier_limit", requested)))
             if tier_count < 1:
                 continue
             assembly_id = str(corner["assembly_id"])

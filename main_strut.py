@@ -61,10 +61,13 @@ def export_strut_dxf(
             layer = MEMBER_LAYERS.get(member.get("kind"), "DEBUG_NODE")
             geometry = member.get("geometry", [])
             if len(geometry) >= 2:
+                attributes: dict[str, Any] = {"layer": layer}
+                if member.get("kind") == "truss_chord" and member.get("support_role") == "reentrant_opposite_strut":
+                    attributes["color"] = LAYER_COLORS["STRUT"]
                 msp.add_lwpolyline(
                     geometry,
                     close=member.get("kind") in {"waling", "ring_strut"},
-                    dxfattribs={"layer": layer},
+                    dxfattribs=attributes,
                 )
     else:
         _draw_legacy_layout(msp, layout)

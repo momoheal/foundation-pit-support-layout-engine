@@ -323,6 +323,44 @@ def _check_l_shape_support(case: Case, layout: dict[str, Any]) -> int:
         f"L-shaped edge-web apex angles use eight-brace nodes; min={min(apex_angles, default=0.0):.3f}",
     )
     failures += _check(
+        bool(apex_angles) and max(apex_angles) <= 100.0 + 1e-4,
+        "L-shaped complete web apex angles do not exceed 100 degrees",
+    )
+    logical = _logical_members(layout["members"])
+    groups: dict[str, list[dict[str, Any]]] = {}
+    ordinary = [m for m in logical if m["kind"] == "main_strut" and not m.get("conversion_group")]
+    for member in ordinary:
+        groups.setdefault(member.get("opposite_pair_id", "MISSING"), []).append(member)
+    failures += _check(
+        "MISSING" not in groups and len(groups) == 3 and all(len(g) == 2 for g in groups.values()),
+        "L-shaped ordinary struts have three explicit two-rod groups, no singleton fill",
+    )
+    pair_gaps = [LineString(g[0]["geometry"]).distance(LineString(g[1]["geometry"]))
+                 for g in groups.values() if len(g) == 2]
+    failures += _check(
+        bool(pair_gaps) and max(pair_gaps) - min(pair_gaps) < 1e-5,
+        f"L-shaped pair gaps are consistent: {pair_gaps}",
+    )
+    for index, (a, b) in enumerate(zip(layout["waling"], layout["waling"][1:]), 1):
+        edge = LineString([a, b])
+        intervals = sorted(sorted(edge.project(Point(p)) for p in (m["geometry"][0], m["geometry"][-1]))
+                           for m in logical if m.get("edge_role") == "web"
+                           and m.get("edge_truss_id") == f"edge_truss_{index}")
+        def corner_reach(corner_index: int) -> float:
+            tiers = [m["tier_index"] for m in logical
+                     if m.get("belongs_to_corner_bracket") == f"corner_bracket_{corner_index}"
+                     and m.get("truss_primitive") == "corner_tier"]
+            return 4.5 * max(tiers, default=2)
+
+        cursor = corner_reach(index)
+        covered = bool(intervals) and abs(intervals[0][0] - cursor) < 1e-5
+        for start, end in intervals:
+            covered = covered and start <= cursor + 1e-5
+            cursor = max(cursor, end)
+        next_corner = index % (len(layout["waling"]) - 1) + 1
+        failures += _check(covered and abs(cursor - (edge.length - corner_reach(next_corner))) < 1e-5,
+                           f"L-shaped edge {index} retains full middle-field diagonal coverage")
+    failures += _check(
         bool(waling)
         and all("edge_truss_outer_chord" in member.get("structural_roles", []) for member in waling),
         "L-shaped waling is the physical outer chord",
